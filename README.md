@@ -14,6 +14,7 @@ Supported Countries:
 - Netherlands
 - Sweden (SE1-SE4)
 - Denmark (DK1-DK2)
+- Finland (FI)
 - Others can be added relatively easily, if there is interest
 
 

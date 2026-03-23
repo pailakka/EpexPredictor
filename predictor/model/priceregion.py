@@ -52,6 +52,7 @@ class PriceRegionName(str, Enum):
     SE4 = "SE4"
     DK1 = "DK1"
     DK2 = "DK2"
+    FI = "FI"
 
     def to_region(self):
         return PRICE_REGIONS[self]
@@ -162,6 +163,15 @@ PRICE_REGIONS[PriceRegionName.DK2] = PriceRegion(
     use_de_nat_gas_price = False, # worse performance for DK
 )
 
+PRICE_REGIONS[PriceRegionName.FI] = PriceRegion(
+    country_code="FI",
+    timezone="Europe/Helsinki",
+    bidding_zone_energycharts=None,
+    bidding_zone_entsoe="FI",
+    latitudes=[60.17, 61.50, 65.01, 67.86],
+    longitudes=[24.94, 23.77, 25.47, 20.22],
+    use_de_nat_gas_price=False, # no strong correlation seen outside central europe
+)
 
 
 
