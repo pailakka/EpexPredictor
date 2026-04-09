@@ -15,5 +15,5 @@ services:
       # 1. It serves as an additional source for price data, in case energy-charts is down
       # 2. It is required to source prices fore some regions (e.g. sweden)
       # 3. It offers an electical load forecast, significantly improving model performance
-      # - EPEXPREDICTOR_ENTSOE_API_KEY=
+      - EPEXPREDICTOR_ENTSOE_API_KEY=a041ec42-b02f-4c3b-869d-b88119faf94a
 

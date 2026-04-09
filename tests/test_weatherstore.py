@@ -108,6 +108,61 @@ class TestWeatherStoreFetchMissingData:
             # Verify a request was made
             assert mock_session_instance.get.called
 
+    @pytest.mark.asyncio
+    async def test_fetch_missing_data_coerces_all_null_irradiance_to_numeric(self, sample_region):
+        """Historical irradiance can be all-null for a location; keep the feature numeric and usable."""
+        store = WeatherStore(sample_region)
+
+        times = [
+            "2025-11-01T00:00",
+            "2025-11-01T00:15",
+            "2025-11-01T00:30",
+            "2025-11-01T00:45",
+        ]
+        mock_response_data = []
+        for i in range(len(sample_region.latitudes)):
+            irradiance = [100.0, 110.0, 120.0, 130.0]
+            if i == len(sample_region.latitudes) - 1:
+                irradiance = [None, None, None, None]
+
+            mock_response_data.append(
+                {
+                    "minutely_15": {
+                        "time": times,
+                        "wind_speed_80m": [5.0, 6.0, 7.0, 8.0],
+                        "temperature_2m": [10.0, 11.0, 12.0, 13.0],
+                        "global_tilted_irradiance": irradiance,
+                        "pressure_msl": [1013.0, 1014.0, 1015.0, 1016.0],
+                        "relative_humidity_2m": [75.0, 76.0, 77.0, 78.0],
+                    }
+                }
+            )
+
+        with patch("aiohttp.ClientSession") as mock_session:
+            mock_response = AsyncMock()
+            mock_response.status = 200
+            mock_response.text = AsyncMock(return_value=json.dumps(mock_response_data))
+
+            mock_context = AsyncMock()
+            mock_context.__aenter__ = AsyncMock(return_value=mock_response)
+            mock_context.__aexit__ = AsyncMock(return_value=None)
+
+            mock_session_instance = MagicMock()
+            mock_session_instance.get = MagicMock(return_value=mock_context)
+            mock_session_instance.__aenter__ = AsyncMock(return_value=mock_session_instance)
+            mock_session_instance.__aexit__ = AsyncMock(return_value=None)
+
+            mock_session.return_value = mock_session_instance
+
+            start = datetime(2025, 11, 1, tzinfo=timezone.utc)
+            end = datetime(2025, 11, 3, tzinfo=timezone.utc)
+
+            await store.fetch_missing_data(start, end)
+
+        last_irradiance_col = f"irradiance_{len(sample_region.latitudes) - 1}"
+        assert pd.api.types.is_numeric_dtype(store.data[last_irradiance_col])
+        assert (store.data[last_irradiance_col] == 0.0).all()
+
 
 class TestWeatherStoreMissingRanges:
     """Tests for gen_missing_date_ranges method."""
