@@ -11,9 +11,21 @@ services:
     
     environment:
       - EPEXPREDICTOR_DATADIR=/data/
+      - EPEXPREDICTOR_ENABLE_REQUEST_TRAINING=false
       # It is highly recommended that you request Entso-E API access and configure the key here. It serves as
       # 1. It serves as an additional source for price data, in case energy-charts is down
       # 2. It is required to source prices fore some regions (e.g. sweden)
       # 3. It offers an electical load forecast, significantly improving model performance
       - EPEXPREDICTOR_ENTSOE_API_KEY=a041ec42-b02f-4c3b-869d-b88119faf94a
+      - EPEXPREDICTOR_FINGRID_API_KEY=56dfc7705cea423aaa47152c6192b48a
 
+  forecast-worker:
+    build: .
+    command: ["python", "-m", "predictor.forecastworker", "--regions", "FI", "--interval-hours", "3"]
+    volumes:
+      - ./data:/data
+    environment:
+      - EPEXPREDICTOR_DATADIR=/data/
+      - EPEXPREDICTOR_ENABLE_REQUEST_TRAINING=false
+      - EPEXPREDICTOR_ENTSOE_API_KEY=a041ec42-b02f-4c3b-869d-b88119faf94a
+      - EPEXPREDICTOR_FINGRID_API_KEY=56dfc7705cea423aaa47152c6192b48a
