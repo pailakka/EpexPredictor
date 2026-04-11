@@ -224,7 +224,7 @@ class TestDataStorePersistenceEdgeCases:
 
     @pytest.mark.asyncio
     async def test_load_corrupted_json_file(self, sample_region, temp_storage_dir):
-        """Test loading from corrupted JSON file raises a ValueError."""
+        """Test loading from corrupted JSON file is ignored safely."""
         import gzip
 
         # Create a corrupted gzip file
@@ -232,9 +232,8 @@ class TestDataStorePersistenceEdgeCases:
         with gzip.open(storage_path, 'wt') as f:
             f.write("{ this is not valid json }")
 
-        # Loading should raise a ValueError (pandas raises this for invalid JSON)
-        with pytest.raises(ValueError):
-            await ConcreteDataStore(sample_region, temp_storage_dir, "test").load()
+        store = await ConcreteDataStore(sample_region, temp_storage_dir, "test").load()
+        assert store.data.empty
 
     def test_load_empty_json_file(self, sample_region, temp_storage_dir):
         """Test loading from empty JSON object."""
