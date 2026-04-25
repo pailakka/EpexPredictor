@@ -648,11 +648,10 @@ class RegionPriceManager:
         if self.update_lock.locked() and len(self.cachedprices) > 0:
             return # don't queue up multiple updates if we already have a filled cache
 
-        update_future = self.update_data_if_needed()
         if len(self.cachedprices) == 0: # first call, no prices yet -> wait until first update is done
-            await update_future
+            await self.update_data_if_needed()
         elif ENABLE_REQUEST_TRAINING:
-            asyncio.create_task(update_future)
+            asyncio.create_task(self.update_data_if_needed())
         else:
             return
 

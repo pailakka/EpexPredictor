@@ -146,12 +146,50 @@ class TestMarketFeatureStore:
 
         assert list(frame.columns) == ["entsoe_load_forecast_forecasted_load"]
 
+    def test_gen_missing_ranges_refreshes_historical_days_missing_new_fi_columns(self, temp_storage_dir):
+        store = MarketFeatureStore(PriceRegionName.FI.to_region(), temp_storage_dir)
+        day = pd.Timestamp.now(tz=timezone.utc).floor("D") - pd.Timedelta(days=10)
+        index = pd.date_range(day, day + pd.Timedelta(days=1), freq="15min", tz="UTC")
+        store.data = pd.DataFrame({"entsoe_load_forecast": [1.0] * len(index)}, index=index)
+
+        ranges = store.gen_missing_date_ranges(day.to_pydatetime(), day.to_pydatetime())
+
+        assert ranges
+        assert ranges[0][0] <= day
+
+    def test_gen_missing_ranges_keeps_complete_historical_fi_day_cached(self, temp_storage_dir):
+        store = MarketFeatureStore(PriceRegionName.FI.to_region(), temp_storage_dir)
+        store.fingrid_api_key = "configured"
+        day = pd.Timestamp.now(tz=timezone.utc).floor("D") - pd.Timedelta(days=10)
+        index = pd.date_range(day, day + pd.Timedelta(days=1), freq="15min", tz="UTC")
+        store.data = pd.DataFrame(
+            {column: [1.0] * len(index) for column in store._historical_required_columns()},
+            index=index,
+        )
+
+        ranges = store.gen_missing_date_ranges(day.to_pydatetime(), day.to_pydatetime())
+
+        assert ranges == []
+
+    def test_historical_required_columns_reflect_configured_sources(self, temp_storage_dir):
+        store = MarketFeatureStore(PriceRegionName.FI.to_region(), temp_storage_dir)
+
+        without_fingrid = store._historical_required_columns()
+        store.fingrid_api_key = "configured"
+        with_fingrid = store._historical_required_columns()
+
+        assert "jao_import_capacity_total" in without_fingrid
+        assert "HydroPrecip_5d_median" in without_fingrid
+        assert "eu_ws_EE01" in without_fingrid
+        assert "fingrid_wind_power_forecast" not in without_fingrid
+        assert "fingrid_wind_power_forecast" in with_fingrid
+
     @pytest.mark.asyncio
     async def test_fetch_fingrid_range_skips_far_historical_requests(self, temp_storage_dir):
         store = MarketFeatureStore(PriceRegionName.FI.to_region(), temp_storage_dir)
         store.fingrid_api_key = "configured"
 
-        far_start = datetime.now(timezone.utc) - timedelta(days=30)
+        far_start = datetime.now(timezone.utc) - timedelta(days=store.FINGRID_HISTORY_LOOKBACK_DAYS + 30)
         far_end = far_start + timedelta(days=1)
 
         frame = await store._fetch_fingrid_range(far_start, far_end)

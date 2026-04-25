@@ -43,6 +43,7 @@ class PricePredictor:
     last_train_start: datetime | None
     last_train_end: datetime | None
     feature_columns: list[str] | None
+    model_excluded_features: set[str]
 
     def __init__(self, region: PriceRegion, storage_dir: str | None = None):
         self.region = region
@@ -59,6 +60,7 @@ class PricePredictor:
         self.last_train_start = None
         self.last_train_end = None
         self.feature_columns = None
+        self.model_excluded_features = set()
 
     async def load_from_persistence(self):
         await asyncio.gather(
@@ -101,17 +103,18 @@ class PricePredictor:
         if train_frame.empty:
             return
 
-        params = self._to_numeric_features(train_frame.drop(columns=["price"]))
+        raw_params = self._to_numeric_frame(train_frame.drop(columns=["price"])).astype(float)
         output = pd.to_numeric(train_frame["price"], errors="coerce")
         valid_rows = output.notna()
-        params = params.loc[valid_rows]
+        raw_params = raw_params.loc[valid_rows]
         output = output.loc[valid_rows]
-        if params.empty:
+        if raw_params.empty:
             return
+        self.model_excluded_features = self._select_model_excluded_features(raw_params, output, end)
+        params = self._drop_model_excluded_features(raw_params)
 
         structural_cols = [c for c in [
             "own_price_lag_2d",
-            "own_price_lag_7d",
             "own_price_rolling_mean_24h",
             "weekday",
             "hour_of_day",
@@ -229,7 +232,6 @@ class PricePredictor:
         # LEAR structural baseline
         structural_cols = [c for c in [
             "own_price_lag_2d",
-            "own_price_lag_7d",
             "own_price_rolling_mean_24h",
             "weekday",
             "hour_of_day",
@@ -264,6 +266,12 @@ class PricePredictor:
             point_forecast,
             generation_time,
         )
+        point_forecast, low_price_multiplier = self._apply_low_price_regime_scaler(
+            params,
+            point_forecast,
+            generation_time,
+            low_wind_multiplier,
+        )
         point_forecast = self._apply_post_model_blend(
             df,
             point_forecast,
@@ -282,6 +290,7 @@ class PricePredictor:
             "features": params,
             "spike_probability": spike_probability.to_frame("spike_probability"),
             "low_wind_multiplier": low_wind_multiplier.to_frame("low_wind_multiplier"),
+            "low_price_multiplier": low_price_multiplier.to_frame("low_price_multiplier"),
         }
 
     def to_price_dict(self, df: pd.DataFrame) -> Dict[datetime, float]:
@@ -436,8 +445,9 @@ class PricePredictor:
         features["market_wind_forecast"] = wind
         features["market_solar_forecast"] = solar
         features["market_generation_forecast"] = generation
-        features["market_residual_load"] = load - wind - solar
-        features["market_dispatchable_gap"] = generation - wind - solar
+        solar_for_residual = solar.fillna(0.0)
+        features["market_residual_load"] = load - wind - solar_for_residual
+        features["market_dispatchable_gap"] = generation - wind - solar_for_residual
         wind_actual = market.get("fingrid_wind_power_realtime", pd.Series(index=feature_index, dtype=float))
         wind_capacity = market.get("fingrid_wind_capacity", pd.Series(index=feature_index, dtype=float)).ffill()
         features["market_wind_actual"] = wind_actual
@@ -532,8 +542,8 @@ class PricePredictor:
         features["market_residual_load_ramp_3h"] = features["market_residual_load"].diff(periods=12)
 
         # Renewable penetration & thermal burden
-        features["market_renewable_penetration"] = (wind + solar) / load.replace(0, np.nan)
-        features["market_thermal_burden"] = load - wind - solar - capacity_import
+        features["market_renewable_penetration"] = (wind + solar_for_residual) / load.replace(0, np.nan)
+        features["market_thermal_burden"] = load - wind - solar_for_residual - capacity_import
 
         # Explicit spatial cross-border features
         for col in market.columns:
@@ -659,7 +669,93 @@ class PricePredictor:
 
     def _to_numeric_features(self, frame: pd.DataFrame) -> pd.DataFrame:
         features = self._to_numeric_frame(frame)
+        features = self._drop_model_excluded_features(features)
         return features.astype(float)
+
+    def _drop_model_excluded_features(self, features: pd.DataFrame) -> pd.DataFrame:
+        drop_columns = [column for column in self.model_excluded_features if column in features.columns]
+        if drop_columns:
+            return features.drop(columns=drop_columns)
+        return features
+
+    def _select_model_excluded_features(
+        self,
+        features: pd.DataFrame,
+        output: pd.Series,
+        train_end: datetime,
+    ) -> set[str]:
+        """
+        Drop stale persistence anchors only when the recent training data says
+        they are worse than shorter-memory alternatives.
+        """
+        lag_columns = [column for column in features.columns if self._own_price_lag_days(column) is not None]
+        if len(lag_columns) < 2:
+            return set()
+
+        cutoff = pd.Timestamp(train_end)
+        cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
+        feature_index = self._ensure_utc_index(pd.DatetimeIndex(features.index))
+        recent_mask = feature_index <= cutoff
+        recent_features = features.loc[recent_mask].tail(96 * 30)
+        recent_output = output.loc[recent_features.index]
+        if len(recent_features) < 96:
+            recent_features = features.loc[recent_mask]
+            recent_output = output.loc[recent_features.index]
+        if len(recent_features) < 96:
+            return set()
+
+        candidate_errors: dict[str, float] = {}
+        comparison_columns = [
+            column for column in [
+                *lag_columns,
+                "own_price_rolling_mean_24h",
+                "own_price_rolling_mean_72h",
+            ]
+            if column in recent_features.columns
+        ]
+        for column in comparison_columns:
+            frame = pd.DataFrame(
+                {
+                    "actual": recent_output,
+                    "candidate": pd.to_numeric(recent_features[column], errors="coerce"),
+                }
+            ).dropna()
+            if len(frame) < 96:
+                continue
+            candidate_errors[column] = float((frame["candidate"] - frame["actual"]).abs().mean())
+
+        if len(candidate_errors) < 2:
+            return set()
+
+        excluded: set[str] = set()
+        for column in lag_columns:
+            lag_days = self._own_price_lag_days(column)
+            if lag_days is None or lag_days <= 2 or column not in candidate_errors:
+                continue
+
+            alternatives: list[float] = []
+            for other_column, error in candidate_errors.items():
+                other_lag_days = self._own_price_lag_days(other_column)
+                if other_lag_days is None or other_lag_days < lag_days:
+                    alternatives.append(error)
+            if not alternatives:
+                continue
+
+            best_alternative = min(alternatives)
+            if best_alternative > 0.0 and candidate_errors[column] > best_alternative * 1.10:
+                excluded.add(column)
+        return excluded
+
+    def _own_price_lag_days(self, column: str) -> int | None:
+        prefix = "own_price_lag_"
+        suffix = "d"
+        if not column.startswith(prefix) or not column.endswith(suffix):
+            return None
+        raw_days = column[len(prefix):-len(suffix)]
+        try:
+            return int(raw_days)
+        except ValueError:
+            return None
 
     def _align_prediction_features(self, frame: pd.DataFrame) -> pd.DataFrame:
         if not self.feature_columns:
@@ -747,7 +843,7 @@ class PricePredictor:
         generated_at: datetime,
     ) -> tuple[pd.DataFrame, pd.Series]:
         multiplier = pd.Series(1.0, index=predictions.index, dtype=float)
-        if self.region.bidding_zone_entsoe != "FI" or "market_wind_forecast" not in features.columns:
+        if "market_wind_forecast" not in features.columns:
             return predictions, multiplier
 
         wind = pd.to_numeric(features["market_wind_forecast"], errors="coerce")
@@ -766,7 +862,7 @@ class PricePredictor:
         cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
         future_mask = pd.Series(predictions.index > cutoff, index=predictions.index)
         price_mask = pd.to_numeric(predictions["price"], errors="coerce").gt(0.0)
-        top_peak_mask = self._select_low_wind_scaler_rows(predictions["price"], future_mask)
+        top_peak_mask = self._select_low_wind_scaler_rows(predictions["price"], future_mask, generated_at)
         apply_mask = future_mask & price_mask & top_peak_mask & scaled.gt(1.0)
 
         if not apply_mask.any():
@@ -803,39 +899,205 @@ class PricePredictor:
 
         return float(history.quantile(0.15)), float(history.quantile(0.35))
 
-    def _select_low_wind_scaler_rows(self, prices: pd.Series, future_mask: pd.Series) -> pd.Series:
+    def _select_low_wind_scaler_rows(
+        self,
+        prices: pd.Series,
+        future_mask: pd.Series,
+        generated_at: datetime,
+    ) -> pd.Series:
         result = pd.Series(False, index=prices.index)
         if prices.empty:
             return result
 
-        local_index = prices.index.tz_convert("Europe/Helsinki")
+        local_index = prices.index.tz_convert(self.region.get_timezone_info())
         local_hour = pd.Series(local_index.hour, index=prices.index)
         local_date = pd.Series(local_index.date, index=prices.index)
-        morning_mask = local_hour.ge(6) & local_hour.lt(12)
-        evening_mask = local_hour.ge(16) & local_hour.lt(22)
+        peak_hours = self._recent_peak_hours(generated_at)
 
         for _, day_prices in prices.groupby(local_date):
             candidate_mask = future_mask.reindex(day_prices.index, fill_value=False)
-            morning_prices = day_prices[candidate_mask & morning_mask.reindex(day_prices.index, fill_value=False)].dropna()
-            evening_prices = day_prices[candidate_mask & evening_mask.reindex(day_prices.index, fill_value=False)].dropna()
-            valid_count = len(morning_prices) + len(evening_prices)
-            if valid_count == 0:
+            candidate_prices = day_prices[candidate_mask].dropna()
+            if candidate_prices.empty:
                 continue
 
-            n_top = max(1, math.ceil(valid_count * 0.19))
-            n_morning = min(len(morning_prices), math.ceil(n_top / 2))
-            n_evening = min(len(evening_prices), n_top - n_morning)
-            if n_evening < len(evening_prices) and n_morning < math.ceil(n_top / 2):
-                n_evening = min(len(evening_prices), n_top - n_morning)
-            if n_morning + n_evening < n_top:
-                n_morning = min(len(morning_prices), n_morning + (n_top - n_morning - n_evening))
+            if peak_hours:
+                peak_mask = local_hour.reindex(candidate_prices.index).isin(peak_hours)
+                peak_prices = candidate_prices[peak_mask]
+                if not peak_prices.empty:
+                    candidate_prices = peak_prices
 
-            if n_morning > 0:
-                result.loc[morning_prices.nlargest(n_morning).index] = True
-            if n_evening > 0:
-                result.loc[evening_prices.nlargest(n_evening).index] = True
+            n_top = max(1, math.ceil(len(candidate_prices) * 0.20))
+            result.loc[candidate_prices.nlargest(n_top).index] = True
 
         return result
+
+    def _recent_peak_hours(self, generated_at: datetime) -> set[int]:
+        if self.traindata is None or "price" not in self.traindata.columns:
+            return set()
+
+        cutoff = pd.Timestamp(generated_at)
+        cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
+        prices = pd.to_numeric(self.traindata["price"], errors="coerce")
+        prices.index = self._ensure_utc_index(pd.DatetimeIndex(prices.index))
+        history = prices.loc[:cutoff].dropna().tail(96 * 90)
+        if len(history) < 96 * 7:
+            return set()
+
+        local_hours = pd.Series(history.index.tz_convert(self.region.get_timezone_info()).hour, index=history.index)
+        hourly_median = history.groupby(local_hours).median()
+        if hourly_median.empty:
+            return set()
+
+        threshold = float(hourly_median.quantile(0.75))
+        return set(int(hour) for hour in hourly_median[hourly_median >= threshold].index)
+
+    def _apply_low_price_regime_scaler(
+        self,
+        features: pd.DataFrame,
+        predictions: pd.DataFrame,
+        generated_at: datetime,
+        low_wind_multiplier: pd.Series | None = None,
+    ) -> tuple[pd.DataFrame, pd.Series]:
+        multiplier = pd.Series(1.0, index=predictions.index, dtype=float)
+        thresholds = self._low_price_regime_thresholds(generated_at, features)
+        if len(thresholds) < 2:
+            return predictions, multiplier
+        price_ceiling = self._low_price_ceiling(generated_at)
+        if price_ceiling is None:
+            return predictions, multiplier
+        learned_multiplier = self._low_price_regime_multiplier(generated_at, thresholds, price_ceiling)
+        if learned_multiplier >= 1.0:
+            return predictions, multiplier
+
+        cutoff = pd.Timestamp(generated_at)
+        cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
+        future_mask = pd.Series(predictions.index > cutoff, index=predictions.index)
+        price = pd.to_numeric(predictions["price"], errors="coerce")
+        price_mask = price.gt(0.0) & price.le(price_ceiling)
+
+        score = pd.Series(0, index=predictions.index, dtype=int)
+        for column, threshold in thresholds.items():
+            score = score + self._low_price_signal(features, column, threshold)
+
+        min_score = max(2, math.ceil(len(thresholds) * 0.60))
+        apply_mask = future_mask & price_mask & score.ge(min_score)
+        if low_wind_multiplier is not None and not low_wind_multiplier.empty:
+            apply_mask = apply_mask & low_wind_multiplier.reindex(predictions.index).fillna(1.0).le(1.0)
+
+        if not apply_mask.any():
+            return predictions, multiplier
+
+        result = predictions.copy()
+        multiplier.loc[apply_mask] = learned_multiplier
+        result.loc[apply_mask, "price"] = result.loc[apply_mask, "price"] * multiplier.loc[apply_mask]
+        return result, multiplier
+
+    def _low_price_regime_thresholds(
+        self,
+        generated_at: datetime,
+        prediction_features: pd.DataFrame,
+    ) -> dict[str, tuple[float, bool]]:
+        signal_quantiles = {
+            "market_thermal_burden": (0.35, False),
+            "market_renewable_penetration": (0.65, True),
+            "available_import_headroom": (0.65, True),
+            "own_price_rolling_mean_24h": (0.35, False),
+            "wind_mean": (0.65, True),
+            "market_wind_forecast": (0.65, True),
+            "market_wind_utilization": (0.65, True),
+        }
+        columns = list(signal_quantiles.keys())
+        cutoff = pd.Timestamp(generated_at)
+        cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
+
+        history = pd.DataFrame()
+        if self.traindata is not None:
+            available = [column for column in columns if column in self.traindata.columns]
+            if available:
+                history = self._to_numeric_frame(self.traindata[available])
+                history.index = self._ensure_utc_index(pd.DatetimeIndex(history.index))
+                history = history.loc[:cutoff].tail(96 * 90)
+
+        if len(history.dropna(how="all")) < 96:
+            available = [column for column in columns if column in prediction_features.columns]
+            if available:
+                history = self._to_numeric_frame(prediction_features[available])
+                history.index = self._ensure_utc_index(pd.DatetimeIndex(history.index))
+                history = history.loc[:cutoff].tail(96 * 14)
+
+        thresholds: dict[str, tuple[float, bool]] = {}
+        for column, (quantile, high_is_low_price_signal) in signal_quantiles.items():
+            if column not in history.columns:
+                continue
+            values = pd.to_numeric(history[column], errors="coerce").dropna()
+            if len(values) < 24:
+                continue
+            thresholds[column] = (float(values.quantile(quantile)), high_is_low_price_signal)
+        return thresholds
+
+    def _low_price_ceiling(self, generated_at: datetime) -> float | None:
+        if self.traindata is None or "price" not in self.traindata.columns:
+            return None
+        cutoff = pd.Timestamp(generated_at)
+        cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
+        prices = pd.to_numeric(self.traindata["price"], errors="coerce")
+        prices.index = self._ensure_utc_index(pd.DatetimeIndex(prices.index))
+        history = prices.loc[:cutoff].dropna().tail(96 * 90)
+        positive = history[history > 0.0]
+        if len(positive) < 96:
+            return None
+        return float(positive.quantile(0.60))
+
+    def _low_price_regime_multiplier(
+        self,
+        generated_at: datetime,
+        thresholds: dict[str, tuple[float, bool]],
+        price_ceiling: float,
+    ) -> float:
+        if self.traindata is None or "price" not in self.traindata.columns:
+            return 1.0
+
+        cutoff = pd.Timestamp(generated_at)
+        cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
+        history = self.traindata.loc[:cutoff].tail(96 * 90)
+        if history.empty:
+            return 1.0
+
+        prices = pd.to_numeric(history["price"], errors="coerce")
+        positive_prices = prices[prices > 0.0].dropna()
+        if len(positive_prices) < 96:
+            return 1.0
+
+        score = pd.Series(0, index=history.index, dtype=int)
+        for column, threshold in thresholds.items():
+            score = score + self._low_price_signal(history, column, threshold)
+
+        min_score = max(2, math.ceil(len(thresholds) * 0.60))
+        regime_prices = prices[score.ge(min_score) & prices.gt(0.0) & prices.le(price_ceiling)].dropna()
+        low_bucket = positive_prices[positive_prices <= price_ceiling]
+        if len(regime_prices) >= 24 and len(low_bucket) >= 24:
+            baseline = float(low_bucket.median())
+            if baseline > 0.0:
+                return float(np.clip(float(regime_prices.median()) / baseline, 0.55, 0.85))
+
+        baseline = float(positive_prices.quantile(0.50))
+        if baseline <= 0.0:
+            return 1.0
+        return float(np.clip(float(positive_prices.quantile(0.20)) / baseline, 0.55, 0.85))
+
+    def _low_price_signal(
+        self,
+        features: pd.DataFrame,
+        column: str,
+        threshold: tuple[float, bool],
+    ) -> pd.Series:
+        if column not in features.columns:
+            return pd.Series(0, index=features.index, dtype=int)
+        threshold_value, high_is_low_price_signal = threshold
+        values = pd.to_numeric(features[column], errors="coerce")
+        if high_is_low_price_signal:
+            return values.ge(threshold_value).fillna(False).astype(int)
+        return values.le(threshold_value).fillna(False).astype(int)
 
     def _apply_post_model_blend(
         self,
@@ -862,8 +1124,8 @@ class PricePredictor:
         mask = yesterday_baseline.notna()
         if mask.any():
             dynamic_weight = pd.Series(weight, index=result.index, dtype=float)
-            if self.region.bidding_zone_entsoe == "FI" and feature_frame is not None:
-                dynamic_weight = self._adjust_fi_blend_weight_for_feature_availability(
+            if self.region.use_market_features and feature_frame is not None:
+                dynamic_weight = self._adjust_blend_weight_for_feature_availability(
                     dynamic_weight,
                     feature_frame,
                     generated_at,
@@ -879,25 +1141,40 @@ class PricePredictor:
             )
         return result
 
-    def _adjust_fi_blend_weight_for_feature_availability(
+    def _adjust_blend_weight_for_feature_availability(
         self,
         dynamic_weight: pd.Series,
         feature_frame: pd.DataFrame,
         generated_at: datetime | None,
     ) -> pd.Series:
-        critical_columns = [
+        core_columns = [
             "market_load_forecast",
             "market_wind_forecast",
-            "available_import_headroom",
-            "fi_nuclear_available_mw",
+            "market_residual_load",
         ]
+        support_columns = [
+            "available_import_headroom",
+            *[
+                column for column in feature_frame.columns
+                if "nuclear" in column and (column.endswith("_actual") or "available" in column)
+            ],
+        ]
+        critical_columns = [column for column in [*core_columns, *support_columns] if column in feature_frame.columns]
         available_columns = [column for column in critical_columns if column in feature_frame.columns]
         if not available_columns:
             return dynamic_weight
 
         result = dynamic_weight.copy()
         available_count = feature_frame[available_columns].notna().sum(axis=1).reindex(result.index, fill_value=0)
-        weak_physical_inputs = available_count.lt(2)
+        present_core_columns = [column for column in core_columns if column in feature_frame.columns]
+        if present_core_columns:
+            core_forecasts_available = (
+                feature_frame[present_core_columns].notna().all(axis=1).reindex(result.index, fill_value=False)
+            )
+        else:
+            core_forecasts_available = pd.Series(True, index=result.index)
+        required_count = max(1, math.ceil(len(available_columns) * 0.40))
+        weak_physical_inputs = available_count.lt(required_count) | ~core_forecasts_available
         if not weak_physical_inputs.any():
             return result
 

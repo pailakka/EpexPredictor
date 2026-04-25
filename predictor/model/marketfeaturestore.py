@@ -39,7 +39,7 @@ class MarketFeatureStore(DataStore):
         "fingrid_electric_boiler": 371,
     }
     FINGRID_MIN_SECONDS_BETWEEN_REQUESTS = 6.2
-    FINGRID_HISTORY_LOOKBACK_DAYS = 2
+    FINGRID_HISTORY_LOOKBACK_DAYS = 150
     FINGRID_FUTURE_LOOKAHEAD_DAYS = 10
     FINGRID_REFRESH_COOLDOWN = timedelta(minutes=15)
     FINGRID_METADATA_KEYS = {
@@ -58,6 +58,15 @@ class MarketFeatureStore(DataStore):
         "valuefloat",
         "valuenumber",
     }
+    FINGRID_HISTORICAL_REQUIRED_COLUMNS = [
+        "fingrid_load_forecast",
+        "fingrid_wind_power_realtime",
+        "fingrid_wind_power_forecast",
+        "fingrid_wind_forecast",
+        "fingrid_solar_forecast",
+        "fingrid_wind_capacity",
+        "fingrid_nuclear_production",
+    ]
 
     SHADOW_PRICE_AREAS = ["SE_1", "SE_3", "EE", "NO_4"]
     JAO_IMPORT_COLUMNS = {
@@ -96,7 +105,6 @@ class MarketFeatureStore(DataStore):
             "extra_filter": "",
         },
     ]
-
     def __init__(self, region: PriceRegion, storage_dir: str | None = None):
         super().__init__(region, storage_dir, "market_v1")
         self.update_lock = asyncio.Lock()
@@ -130,16 +138,63 @@ class MarketFeatureStore(DataStore):
         current = start
         while current <= end:
             next_day = current + timedelta(days=1)
+            day_needs_refresh = self._market_day_needs_refresh(current)
             too_long = range_start is not None and (current - range_start).days >= 14
-            if range_start is not None and (next_day in self.data.index or next_day > end or too_long):
+
+            if range_start is not None and (not day_needs_refresh or too_long):
                 result.append((pd.Timestamp(range_start), pd.Timestamp(current)))
                 range_start = None
 
-            if range_start is None and current not in self.data.index:
+            if range_start is None and day_needs_refresh:
                 range_start = current
 
             current = next_day
+
+        if range_start is not None:
+            result.append((pd.Timestamp(range_start), pd.Timestamp(end)))
         return result
+
+    def _market_day_needs_refresh(self, day: datetime) -> bool:
+        day_ts = pd.Timestamp(day)
+        if day_ts.tzinfo is None:
+            day_ts = day_ts.tz_localize("UTC")
+        else:
+            day_ts = day_ts.tz_convert("UTC")
+        if day_ts not in self.data.index:
+            return True
+
+        required_columns = self._historical_required_columns()
+        if not required_columns:
+            return False
+
+        today_utc = pd.Timestamp.now(tz=timezone.utc).floor("D")
+        if day_ts >= today_utc:
+            return False
+
+        day_end = day_ts + pd.Timedelta(days=1)
+        day_frame = self.data.loc[(self.data.index >= day_ts) & (self.data.index < day_end)]
+        if day_frame.empty:
+            return True
+
+        for column in required_columns:
+            if column not in day_frame.columns or day_frame[column].notna().sum() == 0:
+                return True
+        return False
+
+    def _historical_required_columns(self) -> list[str]:
+        if self.region.bidding_zone_entsoe != "FI":
+            return []
+
+        columns: list[str] = []
+        if self.fingrid_api_key is not None:
+            columns.extend(self.FINGRID_HISTORICAL_REQUIRED_COLUMNS)
+        columns.extend(self.JAO_IMPORT_COLUMNS.values())
+        columns.append("jao_import_capacity_total")
+        for metric in self.SYKE_HYDRO_METRICS:
+            columns.append(f"{metric['name']}_median")
+            columns.append(f"{metric['name']}_p10")
+        columns.extend(location[0] for location in self.BALTIC_WIND_LOCATIONS)
+        return list(dict.fromkeys(columns))
 
     async def refresh_range(self, rstart: datetime, rend: datetime) -> bool:
         if not self.region.use_market_features:
@@ -303,7 +358,12 @@ class MarketFeatureStore(DataStore):
 
         # Use file mtime as a persistent cooldown so restarts don't bypass the limit
         effective_last_refresh = self.last_fingrid_refresh or self.get_storage_mtime()
-        if effective_last_refresh is not None and now - effective_last_refresh < self.FINGRID_REFRESH_COOLDOWN:
+        historical_backfill = rend < now - timedelta(days=1)
+        if (
+            not historical_backfill
+            and effective_last_refresh is not None
+            and now - effective_last_refresh < self.FINGRID_REFRESH_COOLDOWN
+        ):
             return pd.DataFrame()
 
         query_window_start = now - timedelta(days=self.FINGRID_HISTORY_LOOKBACK_DAYS)

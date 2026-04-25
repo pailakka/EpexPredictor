@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+import predictor.api.priceapi as priceapi
 from predictor.model.priceregion import PriceRegionName
 from predictor.api.priceapi import (
     OutputFormat,
@@ -475,6 +476,20 @@ class TestRegionPriceManagerPrices:
 
 class TestRegionPriceManagerUpdateDataIfNeeded:
     """Tests for RegionPriceManager.update_data_if_needed method."""
+
+    @pytest.mark.asyncio
+    async def test_update_in_background_does_not_create_unused_coroutine_when_request_training_disabled(self, sample_region, monkeypatch):
+        manager = RegionPriceManager(sample_region)
+        manager.cachedprices = pd.DataFrame(
+            {"price": [10.0]},
+            index=pd.DatetimeIndex([datetime(2025, 11, 1, tzinfo=timezone.utc)]),
+        )
+        manager.update_data_if_needed = AsyncMock()
+        monkeypatch.setattr(priceapi, "ENABLE_REQUEST_TRAINING", False)
+
+        await manager.update_in_background()
+
+        manager.update_data_if_needed.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_update_triggers_refresh_when_stale(self, sample_region):
