@@ -73,9 +73,11 @@ class TestAuxDataStoreFetchMissingData:
 
         # Check for expected columns
         assert "holiday" in store.data.columns
-        # Day of week columns
-        for i in range(6):
-            assert f"day_{i}" in store.data.columns
+        assert "weekday" in store.data.columns
+        assert "month" in store.data.columns
+        assert "day_of_year" in store.data.columns
+        assert "hour_of_day" in store.data.columns
+        assert "hour_of_week" in store.data.columns
         # Time slot columns (format: i_{hour}_{minute})
         assert "sunelevation" in store.data.columns  # midnight
         assert "azimuth" in store.data.columns  # last slot
@@ -97,24 +99,25 @@ class TestAuxDataStoreFetchMissingData:
         assert len(store.data) >= 4
 
 
-class TestAuxDataStoreDayOfWeekEncoding:
-    """Tests for day of week encoding."""
+class TestAuxDataStoreTemporalEncoding:
+    """Tests for compact temporal encoding."""
 
     @pytest.mark.asyncio
-    async def test_day_columns_are_one_hot(self, sample_region):
-        """Test that day columns are one-hot encoded."""
+    async def test_weekday_and_hour_of_week_are_consistent(self, sample_region):
+        """Test that weekday and hour-of-week encode the local weekly cycle."""
         store = AuxDataStore(sample_region)
         start = datetime(2025, 11, 1, tzinfo=timezone.utc)  # Saturday
         end = datetime(2025, 11, 2, tzinfo=timezone.utc)
 
         await store.fetch_missing_data(start, end)
 
-        # For each row, exactly one day column should be 1 (or 0 for Sunday)
-        day_cols = [f"day_{i}" for i in range(6)]
-        for _, row in store.data.iterrows():
-            day_sum = sum(row[col] for col in day_cols)
-            # Sum should be 0 (Sunday) or 1 (Mon-Sat)
-            assert day_sum in [0, 1]
+        assert store.data["weekday"].between(0, 6).all()
+        expected_hour_of_week = store.data["weekday"] * 24.0 + store.data["hour_of_day"]
+        pd.testing.assert_series_equal(
+            store.data["hour_of_week"],
+            expected_hour_of_week,
+            check_names=False,
+        )
 
 
 
