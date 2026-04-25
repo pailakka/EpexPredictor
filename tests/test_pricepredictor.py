@@ -172,6 +172,8 @@ class TestPricePredictorPredict:
         )
         predictor.predictor = MagicMock()
         predictor.predictor.predict.return_value = np.array([42.0])
+        predictor.lear_model = MagicMock()
+        predictor.lear_model.predict.return_value = np.array([0.0])
         predictor.feature_columns = ["feature_a", "feature_b"]
 
         details = await predictor.predict_with_details(
@@ -211,6 +213,8 @@ class TestPricePredictorPredict:
         predictor.prepare_dataframe = AsyncMock(return_value=df)
         predictor.predictor = MagicMock()
         predictor.predictor.predict.return_value = np.array([30.0, 40.0, 50.0])
+        predictor.lear_model = MagicMock()
+        predictor.lear_model.predict.return_value = np.array([0.0, 0.0, 0.0])
 
         result = await predictor.predict(index[0].to_pydatetime(), index[-1].to_pydatetime(), fill_known=True, generated_at=index[0].to_pydatetime())
 
@@ -232,6 +236,8 @@ class TestPricePredictorPredict:
         predictor.prepare_dataframe = AsyncMock(return_value=df)
         predictor.predictor = MagicMock()
         predictor.predictor.predict.return_value = np.array([40.0])
+        predictor.lear_model = MagicMock()
+        predictor.lear_model.predict.return_value = np.array([0.0])
 
         result = await predictor.predict(index[0].to_pydatetime(), index[0].to_pydatetime(), fill_known=False, generated_at=index[0].to_pydatetime())
 
@@ -258,7 +264,119 @@ class TestPricePredictorPredict:
         features = predictor._build_market_features(marketdata, own_prices, generated_at)
 
         assert features.loc[index[4], "imbalance_long_recent"] == pytest.approx(features.loc[index[3], "imbalance_long_recent"])
-        assert pd.isna(features.loc[index[4], "shadow_price_se_3_lag_1d"])
+        assert pd.isna(features.loc[index[4], "shadow_price_se_3_lag_2d"])
+
+    def test_build_market_features_uses_full_target_index_for_price_lags(self):
+        predictor = PricePredictor(PriceRegionName.FI.to_region())
+        target_index = pd.date_range("2026-04-20T00:00:00Z", periods=8, freq="15min", tz="UTC")
+        market_index = target_index[:4]
+        marketdata = pd.DataFrame(
+            {
+                "entsoe_load_forecast_forecasted_load": [10000.0] * len(market_index),
+                "entsoe_wind_solar_wind_onshore": [1000.0] * len(market_index),
+                "entsoe_wind_solar_solar": [100.0] * len(market_index),
+            },
+            index=market_index,
+        )
+        lag_index = target_index - timedelta(days=7)
+        own_prices = pd.Series(np.arange(len(target_index), dtype=float) + 20.0, index=lag_index)
+
+        features = predictor._build_market_features(
+            marketdata,
+            own_prices,
+            target_index[0].to_pydatetime(),
+            target_index=target_index,
+        )
+
+        assert features.index.equals(target_index)
+        assert features.loc[target_index[-1], "own_price_lag_7d"] == pytest.approx(27.0)
+        assert pd.isna(features.loc[target_index[-1], "market_load_forecast"])
+
+    def test_build_market_features_falls_back_from_fingrid_to_entsoe_wind_rowwise(self):
+        predictor = PricePredictor(PriceRegionName.FI.to_region())
+        index = pd.date_range("2026-04-20T00:00:00Z", periods=3, freq="15min", tz="UTC")
+        marketdata = pd.DataFrame(
+            {
+                "fingrid_wind_power_forecast": [1200.0, np.nan, 1400.0],
+                "fingrid_wind_forecast": [1100.0, np.nan, 1300.0],
+                "entsoe_wind_solar_wind_onshore": [900.0, 950.0, 1000.0],
+                "entsoe_wind_solar_solar": [100.0, 100.0, 100.0],
+                "entsoe_load_forecast_forecasted_load": [10000.0, 10000.0, 10000.0],
+            },
+            index=index,
+        )
+        own_prices = pd.Series([10.0] * len(index), index=index)
+
+        features = predictor._build_market_features(marketdata, own_prices, index[0].to_pydatetime())
+
+        assert features.loc[index[0], "market_wind_forecast"] == pytest.approx(1200.0)
+        assert features.loc[index[1], "market_wind_forecast"] == pytest.approx(950.0)
+        assert features.loc[index[2], "market_wind_forecast"] == pytest.approx(1400.0)
+
+    def test_build_market_features_prefers_jao_import_capacity_total(self):
+        predictor = PricePredictor(PriceRegionName.FI.to_region())
+        index = pd.date_range("2026-04-20T00:00:00Z", periods=2, freq="15min", tz="UTC")
+        marketdata = pd.DataFrame(
+            {
+                "jao_import_capacity_total": [2500.0, np.nan],
+                "capacity_se_1_to_fi": [100.0, 100.0],
+                "capacity_se_3_to_fi": [200.0, 200.0],
+                "capacity_ee_to_fi": [300.0, 300.0],
+                "entsoe_load_forecast_forecasted_load": [10000.0, 10000.0],
+                "entsoe_wind_solar_wind_onshore": [1000.0, 1000.0],
+                "entsoe_wind_solar_solar": [100.0, 100.0],
+            },
+            index=index,
+        )
+        own_prices = pd.Series([10.0] * len(index), index=index)
+
+        features = predictor._build_market_features(marketdata, own_prices, index[0].to_pydatetime())
+
+        assert features.loc[index[0], "available_import_headroom"] == pytest.approx(2500.0)
+        assert features.loc[index[1], "available_import_headroom"] == pytest.approx(600.0)
+
+    def test_low_wind_scaler_gates_and_caps(self):
+        predictor = PricePredictor(PriceRegionName.FI.to_region())
+        index = pd.date_range("2026-04-20T03:00:00Z", periods=96, freq="15min", tz="UTC")
+        features = pd.DataFrame({"market_wind_forecast": [1000.0] * len(index)}, index=index)
+        features.loc[index[20], "market_wind_forecast"] = 100.0
+        predictions = pd.DataFrame({"price": np.linspace(10.0, 100.0, len(index))}, index=index)
+        predictions.loc[index[20], "price"] = 200.0
+        predictor.traindata = pd.DataFrame(
+            {"market_wind_forecast": np.linspace(100.0, 2000.0, 96)},
+            index=index - timedelta(days=1),
+        )
+
+        scaled, multiplier = predictor._apply_low_wind_scaler(
+            features,
+            predictions,
+            pd.Timestamp("2026-04-20T00:00:00Z").to_pydatetime(),
+        )
+
+        assert float(multiplier.max()) <= 1.30
+        assert multiplier.loc[index[20]] > 1.0
+        assert scaled.loc[index[20], "price"] == pytest.approx(predictions.loc[index[20], "price"] * multiplier.loc[index[20]])
+        assert multiplier.loc[index[0]] == pytest.approx(1.0)
+
+    def test_weather_aggregates_added_for_current_and_legacy_columns(self):
+        predictor = PricePredictor(PriceRegionName.FI.to_region())
+        index = pd.date_range("2026-04-20T00:00:00Z", periods=1, freq="15min", tz="UTC")
+        frame = pd.DataFrame(
+            {
+                "temp_0": [0.0],
+                "temperature_2m_1": [2.0],
+                "wind_0": [4.0],
+                "wind_speed_80m_1": [8.0],
+            },
+            index=index,
+        )
+
+        predictor._append_weather_aggregate_features(frame)
+
+        assert frame.loc[index[0], "temp_mean"] == pytest.approx(1.0)
+        assert frame.loc[index[0], "temp_variance"] == pytest.approx(2.0)
+        assert frame.loc[index[0], "wind_mean"] == pytest.approx(6.0)
+        assert frame.loc[index[0], "wind_variance"] == pytest.approx(8.0)
 
 
 class TestPricePredictorCleanup:

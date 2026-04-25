@@ -26,10 +26,14 @@ class MarketFeatureStore(DataStore):
 
     FINGRID_DATASETS = {
         "fingrid_load_forecast": 166,
+        "fingrid_wind_power_realtime": 181,
+        "fingrid_wind_power_forecast": 245,
         "fingrid_wind_forecast": 246,
         "fingrid_solar_forecast": 247,
+        "fingrid_wind_capacity": 268,
         "fingrid_capacity_fi_ee": 115,
         "fingrid_capacity_ee_fi": 112,
+        "fingrid_nuclear_production": 188,
         "fingrid_imbalance": 397,
         "fingrid_commercial_flow_fi_ee": 140,
         "fingrid_electric_boiler": 371,
@@ -56,6 +60,42 @@ class MarketFeatureStore(DataStore):
     }
 
     SHADOW_PRICE_AREAS = ["SE_1", "SE_3", "EE", "NO_4"]
+    JAO_IMPORT_COLUMNS = {
+        "border_SE1_FI": "jao_import_capacity_se1_fi",
+        "border_SE3_FI": "jao_import_capacity_se3_fi",
+        "border_EE_FI": "jao_import_capacity_ee_fi",
+    }
+    JAO_ENDPOINT = "https://publicationtool.jao.eu/nordic/api/data/maxBorderFlow"
+    JAO_WINDOW_HOURS = 48
+
+    BALTIC_WIND_LOCATIONS = [
+        ("eu_ws_EE01", 58.8960, 22.5605),
+        ("eu_ws_EE02", 58.6347, 25.1230),
+        ("eu_ws_DK01", 56.4260, 8.1281),
+        ("eu_ws_DK02", 56.6013, 11.1047),
+        ("eu_ws_DE01", 54.2194, 9.6961),
+        ("eu_ws_DE02", 52.6367, 9.8451),
+        ("eu_ws_SE01", 65.2536, 21.6020),
+        ("eu_ws_SE02", 64.5000, 17.0000),
+        ("eu_ws_SE03", 59.7852, 13.0042),
+    ]
+
+    SYKE_ODATA_BASE = "https://rajapinnat.ymparisto.fi/api/Hydrologiarajapinta/1.1/odata"
+    SYKE_CARRY_DAYS = 60
+    SYKE_HYDRO_METRICS = [
+        {
+            "name": "HydroPrecip_5d",
+            "entity": "SadantaAlue",
+            "places": [848, 852, 810, 811, 834, 837, 879, 881, 885, 886],
+            "extra_filter": "Jakso_Id eq 2",
+        },
+        {
+            "name": "HydroSWE",
+            "entity": "LumiAlue",
+            "places": [196, 200, 159, 160, 183, 185, 226, 228, 232, 233],
+            "extra_filter": "",
+        },
+    ]
 
     def __init__(self, region: PriceRegion, storage_dir: str | None = None):
         super().__init__(region, storage_dir, "market_v1")
@@ -115,6 +155,18 @@ class MarketFeatureStore(DataStore):
         fingrid_frame = await self._fetch_fingrid_range(rstart, rend)
         if not fingrid_frame.empty:
             frames.append(fingrid_frame)
+
+        jao_frame = await self._fetch_jao_range(rstart, rend)
+        if not jao_frame.empty:
+            frames.append(jao_frame)
+
+        baltic_wind_frame = await self._fetch_baltic_wind_range(rstart, rend)
+        if not baltic_wind_frame.empty:
+            frames.append(baltic_wind_frame)
+
+        hydrology_frame = await self._fetch_hydrology_range(rstart, rend)
+        if not hydrology_frame.empty:
+            frames.append(hydrology_frame)
 
         if not frames:
             return False
@@ -313,6 +365,351 @@ class MarketFeatureStore(DataStore):
             self.last_fingrid_refresh = now
             return combined.loc[pd.Timestamp(rstart):pd.Timestamp(rend)]
 
+    async def _fetch_jao_range(self, rstart: datetime, rend: datetime) -> pd.DataFrame:
+        if self.region.bidding_zone_entsoe != "FI":
+            return pd.DataFrame()
+
+        qstart = self._utc_timestamp(rstart)
+        qend = self._utc_timestamp(rend)
+        frames: list[pd.DataFrame] = []
+
+        async with aiohttp.ClientSession() as session:
+            cursor = qstart
+            while cursor < qend:
+                window_end = min(cursor + pd.Timedelta(hours=self.JAO_WINDOW_HOURS), qend)
+                params = {
+                    "FromUtc": cursor.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                    "ToUtc": window_end.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                }
+                try:
+                    async with session.get(
+                        self.JAO_ENDPOINT,
+                        params=params,
+                        timeout=aiohttp.ClientTimeout(total=30),
+                    ) as response:
+                        text = await response.text()
+                        if response.status >= 400:
+                            raise RuntimeError(f"HTTP {response.status}: {text[:300]}")
+                        payload = await response.json()
+                except Exception as exc:
+                    log.warning("%s: JAO import capacity unavailable: %s", self.region.bidding_zone_entsoe, exc)
+                    cursor = window_end
+                    continue
+
+                frame = self._normalize_jao_payload(payload)
+                if not frame.empty:
+                    frames.append(frame)
+                cursor = window_end
+
+        if not frames:
+            return pd.DataFrame()
+
+        combined = pd.concat(frames).sort_index()
+        combined = combined[~combined.index.duplicated(keep="last")]
+        return combined.loc[qstart:qend]
+
+    def _normalize_jao_payload(self, payload: Any) -> pd.DataFrame:
+        items = payload
+        if isinstance(payload, dict):
+            items = payload.get("data") or payload.get("result") or payload.get("items") or []
+
+        rows: list[dict[str, Any]] = []
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            raw_time = item.get("dateTimeUtc") or item.get("startTime") or item.get("time")
+            if raw_time is None:
+                continue
+            row: dict[str, Any] = {"time": self._utc_timestamp(raw_time)}
+            for source_column, target_column in self.JAO_IMPORT_COLUMNS.items():
+                row[target_column] = pd.to_numeric(item.get(source_column), errors="coerce")
+            rows.append(row)
+
+        if not rows:
+            return pd.DataFrame()
+
+        frame = pd.DataFrame(rows).drop_duplicates(subset=["time"], keep="last")
+        frame.set_index("time", inplace=True)
+        border_columns = list(self.JAO_IMPORT_COLUMNS.values())
+        frame[border_columns] = frame[border_columns].apply(pd.to_numeric, errors="coerce")
+        total = frame[border_columns].sum(axis=1, min_count=1)
+        if total.eq(0.0).any():
+            total = total.mask(total.eq(0.0)).ffill().fillna(0.0)
+        frame["jao_import_capacity_total"] = total
+        frame = frame.sort_index().resample("15min").ffill().bfill()
+        frame.index.name = "time"
+        return frame.dropna(how="all")
+
+    async def _fetch_baltic_wind_range(self, rstart: datetime, rend: datetime) -> pd.DataFrame:
+        if self.region.bidding_zone_entsoe != "FI":
+            return pd.DataFrame()
+
+        qstart = self._utc_timestamp(rstart)
+        qend = self._utc_timestamp(rend)
+        now = pd.Timestamp.now(tz=timezone.utc)
+        frames: list[pd.DataFrame] = []
+        lats = ",".join(str(location[1]) for location in self.BALTIC_WIND_LOCATIONS)
+        lons = ",".join(str(location[2]) for location in self.BALTIC_WIND_LOCATIONS)
+
+        async with aiohttp.ClientSession() as session:
+            archive_end = min(qend, now - pd.Timedelta(days=3))
+            if qstart <= archive_end:
+                params = {
+                    "latitude": lats,
+                    "longitude": lons,
+                    "start_date": qstart.date().isoformat(),
+                    "end_date": archive_end.date().isoformat(),
+                    "hourly": "wind_speed_100m",
+                    "wind_speed_unit": "ms",
+                    "timezone": "UTC",
+                }
+                try:
+                    payload = await self._fetch_openmeteo_wind_payload(
+                        session,
+                        "https://archive-api.open-meteo.com/v1/archive",
+                        params,
+                    )
+                    frame = self._normalize_openmeteo_wind_payload(payload, "wind_speed_100m")
+                    if not frame.empty:
+                        frames.append(frame)
+                except Exception as exc:
+                    log.warning("%s: Baltic historical wind unavailable: %s", self.region.bidding_zone_entsoe, exc)
+
+            if qend >= now - pd.Timedelta(days=5):
+                params = {
+                    "latitude": lats,
+                    "longitude": lons,
+                    "hourly": "wind_speed_120m",
+                    "wind_speed_unit": "ms",
+                    "past_days": 4,
+                    "forecast_days": 10,
+                    "timezone": "UTC",
+                }
+                try:
+                    payload = await self._fetch_openmeteo_wind_payload(
+                        session,
+                        "https://api.open-meteo.com/v1/forecast",
+                        params,
+                    )
+                    frame = self._normalize_openmeteo_wind_payload(payload, "wind_speed_120m")
+                    if not frame.empty:
+                        frames.append(frame)
+                except Exception as exc:
+                    log.warning("%s: Baltic forecast wind unavailable: %s", self.region.bidding_zone_entsoe, exc)
+
+        if not frames:
+            return pd.DataFrame()
+
+        combined = pd.concat(frames).sort_index()
+        combined = combined[~combined.index.duplicated(keep="last")]
+        combined = combined.resample("15min").interpolate("time").ffill().bfill()
+        combined.index.name = "time"
+        return combined.loc[qstart:qend]
+
+    async def _fetch_openmeteo_wind_payload(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        params: dict[str, Any],
+    ) -> Any:
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=45)) as response:
+            text = await response.text()
+            if response.status >= 400:
+                raise RuntimeError(f"HTTP {response.status}: {text[:300]}")
+            return await response.json()
+
+    def _normalize_openmeteo_wind_payload(self, payload: Any, value_key: str) -> pd.DataFrame:
+        items = payload if isinstance(payload, list) else [payload]
+        frames: list[pd.DataFrame] = []
+        for i, item in enumerate(items[: len(self.BALTIC_WIND_LOCATIONS)]):
+            if not isinstance(item, dict):
+                continue
+            hourly = item.get("hourly") or {}
+            raw_times = hourly.get("time")
+            raw_values = hourly.get(value_key)
+            if raw_times is None or raw_values is None:
+                continue
+            code = self.BALTIC_WIND_LOCATIONS[i][0]
+            frame = pd.DataFrame(
+                {
+                    "time": pd.to_datetime(raw_times, utc=True, errors="coerce"),
+                    code: pd.to_numeric(pd.Series(raw_values), errors="coerce"),
+                }
+            ).dropna(subset=["time"])
+            if frame.empty:
+                continue
+            frame.set_index("time", inplace=True)
+            frames.append(frame)
+
+        if not frames:
+            return pd.DataFrame()
+
+        combined = pd.concat(frames, axis=1).sort_index()
+        combined = combined[~combined.index.duplicated(keep="last")]
+        combined.index.name = "time"
+        return combined.dropna(how="all")
+
+    async def _fetch_hydrology_range(self, rstart: datetime, rend: datetime) -> pd.DataFrame:
+        if self.region.bidding_zone_entsoe != "FI":
+            return pd.DataFrame()
+
+        qstart = self._utc_timestamp(rstart)
+        qend = self._utc_timestamp(rend)
+        if qend < qstart:
+            return pd.DataFrame()
+
+        target_index = pd.date_range(qstart.floor("15min"), qend.ceil("15min"), freq="15min", tz=timezone.utc)
+        if target_index.empty:
+            return pd.DataFrame()
+
+        now = pd.Timestamp.now(tz=timezone.utc)
+        last_complete_day = now.floor("D") - pd.Timedelta(days=1)
+        fetch_start_day = min(target_index.min().floor("D"), last_complete_day) - pd.Timedelta(days=self.SYKE_CARRY_DAYS)
+        fetch_end_day = last_complete_day
+        rows_by_metric: dict[str, pd.DataFrame] = {}
+
+        async with aiohttp.ClientSession() as session:
+            for metric in self.SYKE_HYDRO_METRICS:
+                try:
+                    rows_by_metric[metric["name"]] = await self._fetch_syke_metric_rows(
+                        session,
+                        metric,
+                        fetch_start_day.to_pydatetime(),
+                        fetch_end_day.to_pydatetime(),
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "%s: SYKE hydrology %s unavailable: %s",
+                        self.region.bidding_zone_entsoe,
+                        metric["name"],
+                        exc,
+                    )
+                    rows_by_metric[metric["name"]] = pd.DataFrame()
+
+        frame = self._compute_hydrology_frame(rows_by_metric, target_index)
+        return frame.loc[qstart:qend]
+
+    async def _fetch_syke_metric_rows(
+        self,
+        session: aiohttp.ClientSession,
+        metric: dict[str, Any],
+        start: datetime,
+        end: datetime,
+        chunk_days: int = 31,
+        top: int = 500,
+    ) -> pd.DataFrame:
+        if start > end:
+            return pd.DataFrame(columns=["Aika", "Paikka_Id", "Arvo"])
+
+        frames: list[pd.DataFrame] = []
+        cursor = self._utc_timestamp(start)
+        end_ts = self._utc_timestamp(end)
+        places = metric.get("places", [])
+        place_filter = " or ".join(f"Paikka_Id eq {place_id}" for place_id in places)
+
+        while cursor <= end_ts:
+            chunk_end = min(cursor + pd.Timedelta(days=chunk_days), end_ts)
+            query_filter = (
+                f"Aika ge datetime'{cursor.strftime('%Y-%m-%dT%H:%M:%S')}' and "
+                f"Aika le datetime'{chunk_end.strftime('%Y-%m-%dT%H:%M:%S')}' and "
+                f"({place_filter})"
+            )
+            if metric.get("extra_filter"):
+                query_filter = f"{query_filter} and {metric['extra_filter']}"
+
+            skip = 0
+            while True:
+                params = {
+                    "$top": str(top),
+                    "$skip": str(skip),
+                    "$select": "Paikka_Id,Aika,Arvo",
+                    "$filter": query_filter,
+                    "$orderby": "Aika asc",
+                }
+                url = f"{self.SYKE_ODATA_BASE}/{metric['entity']}"
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=45)) as response:
+                    text = await response.text()
+                    if response.status >= 400:
+                        raise RuntimeError(f"HTTP {response.status}: {text[:300]}")
+                    payload = await response.json()
+
+                rows = payload.get("value", []) if isinstance(payload, dict) else []
+                if rows:
+                    frames.append(self._normalize_syke_rows(rows))
+                if len(rows) < top:
+                    break
+                skip += top
+
+            cursor = chunk_end + pd.Timedelta(seconds=1)
+
+        if not frames:
+            return pd.DataFrame(columns=["Aika", "Paikka_Id", "Arvo"])
+
+        frame = pd.concat(frames, ignore_index=True)
+        frame = frame.drop_duplicates(subset=["Paikka_Id", "Aika"], keep="last")
+        return frame.sort_values(["Aika", "Paikka_Id"]).reset_index(drop=True)
+
+    def _normalize_syke_rows(self, rows: list[dict[str, Any]]) -> pd.DataFrame:
+        frame = pd.DataFrame(rows)
+        if frame.empty:
+            return pd.DataFrame(columns=["Aika", "Paikka_Id", "Arvo"])
+        frame["Aika"] = pd.to_datetime(frame.get("Aika"), utc=True, errors="coerce")
+        frame["Paikka_Id"] = pd.to_numeric(frame.get("Paikka_Id"), errors="coerce")
+        frame["Arvo"] = pd.to_numeric(frame.get("Arvo"), errors="coerce")
+        frame = frame.dropna(subset=["Aika", "Paikka_Id", "Arvo"])
+        if frame.empty:
+            return pd.DataFrame(columns=["Aika", "Paikka_Id", "Arvo"])
+        frame["Paikka_Id"] = frame["Paikka_Id"].astype(int)
+        return frame[["Aika", "Paikka_Id", "Arvo"]]
+
+    def _compute_hydrology_frame(
+        self,
+        rows_by_metric: dict[str, pd.DataFrame],
+        index: pd.DatetimeIndex,
+    ) -> pd.DataFrame:
+        index = self._utc_index(index)
+        frame = pd.DataFrame(index=index)
+        if index.empty:
+            return frame
+
+        day_index = pd.date_range(index.min().floor("D"), index.max().floor("D"), freq="D", tz=timezone.utc)
+        target_days = pd.Series(index.floor("D"), index=index)
+
+        for metric in self.SYKE_HYDRO_METRICS:
+            name = metric["name"]
+            median_col = f"{name}_median"
+            p10_col = f"{name}_p10"
+            rows = rows_by_metric.get(name, pd.DataFrame())
+            if rows.empty:
+                frame[median_col] = pd.NA
+                frame[p10_col] = pd.NA
+                continue
+
+            source = rows.copy()
+            source["Aika"] = pd.to_datetime(source["Aika"], utc=True, errors="coerce").dt.floor("D")
+            source["Paikka_Id"] = pd.to_numeric(source["Paikka_Id"], errors="coerce")
+            source["Arvo"] = pd.to_numeric(source["Arvo"], errors="coerce")
+            source = source.dropna(subset=["Aika", "Paikka_Id", "Arvo"])
+            if source.empty:
+                frame[median_col] = pd.NA
+                frame[p10_col] = pd.NA
+                continue
+
+            source["Paikka_Id"] = source["Paikka_Id"].astype(int)
+            pivot = source.pivot_table(index="Aika", columns="Paikka_Id", values="Arvo", aggfunc="last")
+            pivot = pivot.reindex(columns=metric.get("places", []))
+            ext_start = min(pivot.index.min(), day_index.min())
+            ext_index = pd.date_range(ext_start, day_index.max(), freq="D", tz=timezone.utc)
+            pivot = pivot.reindex(ext_index).ffill().reindex(day_index)
+
+            median = pivot.median(axis=1, skipna=True)
+            p10 = pivot.quantile(0.10, axis=1, interpolation="linear")
+            frame[median_col] = target_days.map(median)
+            frame[p10_col] = target_days.map(p10)
+
+        frame.index.name = "time"
+        return frame
+
     async def _fetch_fingrid_payload(
         self,
         session: aiohttp.ClientSession,
@@ -432,6 +829,18 @@ class MarketFeatureStore(DataStore):
         if len(candidates) == 1:
             return candidates[0]
         return None
+
+    def _utc_timestamp(self, value: Any) -> pd.Timestamp:
+        timestamp = pd.Timestamp(value)
+        if timestamp.tzinfo is None:
+            return timestamp.tz_localize("UTC")
+        return timestamp.tz_convert("UTC")
+
+    def _utc_index(self, index: pd.DatetimeIndex) -> pd.DatetimeIndex:
+        utc_index = pd.DatetimeIndex(index)
+        if utc_index.tz is None:
+            return utc_index.tz_localize("UTC")
+        return utc_index.tz_convert("UTC")
 
     def _normalize_column_name(self, prefix: str, column: Any) -> str:
         if isinstance(column, tuple):

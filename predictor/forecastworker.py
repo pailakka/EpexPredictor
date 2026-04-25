@@ -43,8 +43,17 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-async def refresh_regions(managers: list[tuple[PriceRegionName, RegionPriceManager]], force: bool) -> None:
-    for region_name, manager in managers:
+async def refresh_regions(
+    managers: list[tuple[PriceRegionName, RegionPriceManager]] | list[PriceRegionName],
+    force: bool,
+) -> None:
+    for item in managers:
+        if isinstance(item, tuple):
+            region_name, manager = item
+        else:
+            region_name = item
+            manager = RegionPriceManager(region_name.to_region())
+            await manager.ensure_loaded()
         log.info("%s: worker refresh started", region_name.value)
         await manager.update_data_if_needed(force=force)
         log.info("%s: worker refresh finished", region_name.value)

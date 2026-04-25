@@ -109,6 +109,19 @@ class PricePredictor:
         if params.empty:
             return
 
+        structural_cols = [c for c in [
+            "own_price_lag_2d",
+            "own_price_lag_7d",
+            "own_price_rolling_mean_24h",
+            "weekday",
+            "hour_of_day",
+            "structural_bias",
+        ] if c in params.columns]
+        if not structural_cols:
+            params = params.copy()
+            params["structural_bias"] = 1.0
+            structural_cols = ["structural_bias"]
+
         self.feature_columns = params.columns.to_list()
 
         # Use raw prices to preserve spike magnitude (no variance-stabilizing transform)
@@ -122,13 +135,6 @@ class PricePredictor:
         # Phase 1: LEAR structural baseline (lags + calendar + price-regime anchor)
         # Including rolling_mean gives LEAR a price-level anchor so it doesn't need
         # to reconstruct the current regime purely from 2d-ago prices.
-        structural_cols = [c for c in [
-            "own_price_lag_2d",
-            "own_price_lag_7d",
-            "own_price_rolling_mean_24h",
-            "weekday",
-            "hour_of_day",
-        ] if c in params.columns]
         structural_params = params[structural_cols].fillna(0)
         self.lear_model = ElasticNet(alpha=0.1, l1_ratio=0.5, fit_intercept=True)
         self.lear_model.fit(structural_params, output_transformed, sample_weight=weights)
@@ -227,6 +233,7 @@ class PricePredictor:
             "own_price_rolling_mean_24h",
             "weekday",
             "hour_of_day",
+            "structural_bias",
         ] if c in params.columns]
         structural_params = params[structural_cols].fillna(0)
         lear_preds = self.lear_model.predict(structural_params)
@@ -252,7 +259,19 @@ class PricePredictor:
             quantiles["q10"] = point_forecast["price"] * 0.9
             quantiles["q90"] = point_forecast["price"] * 1.1
 
-        point_forecast = self._apply_post_model_blend(df, point_forecast, spike_probability)
+        point_forecast, low_wind_multiplier = self._apply_low_wind_scaler(
+            params,
+            point_forecast,
+            generation_time,
+        )
+        point_forecast = self._apply_post_model_blend(
+            df,
+            point_forecast,
+            spike_probability,
+            generated_at=generation_time,
+            feature_frame=params,
+            scaler_multiplier=low_wind_multiplier,
+        )
 
         if fill_known:
             point_forecast.update(prices_known)
@@ -262,6 +281,7 @@ class PricePredictor:
             "quantiles": quantiles,
             "features": params,
             "spike_probability": spike_probability.to_frame("spike_probability"),
+            "low_wind_multiplier": low_wind_multiplier.to_frame("low_wind_multiplier"),
         }
 
     def to_price_dict(self, df: pd.DataFrame) -> Dict[datetime, float]:
@@ -295,6 +315,7 @@ class PricePredictor:
         )
 
         df = pd.concat([weather, auxdata], axis=1, sort=True)
+        self._append_weather_aggregate_features(df)
 
         # Cold-morning demand-spike interaction: colder temp × closer to morning peak.
         # This is the primary driver of Finnish pre-dawn price spikes (06-09 EET) in
@@ -322,6 +343,7 @@ class PricePredictor:
                     marketdata,
                     prices["price"],
                     prediction_generated_at,
+                    target_index=pd.DatetimeIndex(df.index),
                 )
                 if not market_features.empty:
                     df = pd.concat([df, market_features], axis=1, sort=True)
@@ -336,14 +358,39 @@ class PricePredictor:
         df = df[actual_start:]
         return df
 
+    def _append_weather_aggregate_features(self, frame: pd.DataFrame) -> None:
+        temp_columns = [
+            column for column in frame.columns
+            if column.startswith("temp_") or column.startswith("temperature_2m_")
+        ]
+        wind_columns = [
+            column for column in frame.columns
+            if column.startswith("wind_") or column.startswith("wind_speed_")
+        ]
+        if temp_columns:
+            temps = frame[temp_columns].apply(pd.to_numeric, errors="coerce")
+            frame["temp_mean"] = temps.mean(axis=1)
+            frame["temp_variance"] = temps.var(axis=1)
+        if wind_columns:
+            winds = frame[wind_columns].apply(pd.to_numeric, errors="coerce")
+            frame["wind_mean"] = winds.mean(axis=1)
+            frame["wind_variance"] = winds.var(axis=1)
+
     def _build_market_features(
         self,
         marketdata: pd.DataFrame,
         own_prices: pd.Series,
         prediction_generated_at: datetime | None,
+        target_index: pd.DatetimeIndex | None = None,
     ) -> pd.DataFrame:
-        market = self._to_numeric_frame(marketdata)
-        features = pd.DataFrame(index=market.index)
+        market = self._to_numeric_frame(marketdata).sort_index()
+        market.index = self._ensure_utc_index(pd.DatetimeIndex(market.index))
+        if target_index is None:
+            feature_index = market.index
+        else:
+            feature_index = self._ensure_utc_index(target_index)
+        features = pd.DataFrame(index=feature_index)
+        market = market.reindex(feature_index)
 
         load = self._coalesce_columns(
             market,
@@ -353,17 +400,23 @@ class PricePredictor:
                 "entsoe_load_forecast",
             ],
         )
-        if "fingrid_wind_forecast" in market.columns:
-            wind = market["fingrid_wind_forecast"]
-        else:
-            wind = self._coalesce_columns(
-                market,
-                [
-                    "entsoe_wind_solar_wind_onshore",
-                    "entsoe_wind_solar_wind_offshore",
-                ],
-                combine="sum",
-            )
+        entsoe_wind = self._coalesce_columns(
+            market,
+            [
+                "entsoe_wind_solar_wind_onshore",
+                "entsoe_wind_solar_wind_offshore",
+            ],
+            combine="sum",
+        )
+        wind = self._coalesce_series(
+            [
+                market.get("fingrid_wind_power_forecast"),
+                market.get("fingrid_wind_forecast"),
+                entsoe_wind,
+                market.get("fingrid_wind_power_realtime"),
+            ],
+            feature_index,
+        )
         solar = self._coalesce_columns(
             market,
             [
@@ -385,20 +438,66 @@ class PricePredictor:
         features["market_generation_forecast"] = generation
         features["market_residual_load"] = load - wind - solar
         features["market_dispatchable_gap"] = generation - wind - solar
+        wind_actual = market.get("fingrid_wind_power_realtime", pd.Series(index=feature_index, dtype=float))
+        wind_capacity = market.get("fingrid_wind_capacity", pd.Series(index=feature_index, dtype=float)).ffill()
+        features["market_wind_actual"] = wind_actual
+        features["market_wind_capacity"] = wind_capacity
+        features["market_wind_utilization"] = wind / wind_capacity.replace(0, np.nan)
 
-        capacity_import = self._coalesce_columns(
+        entsoe_import_capacity = self._coalesce_columns(
             market,
             [
+                "capacity_se_1_to_fi",
+                "capacity_se_3_to_fi",
+                "capacity_ee_to_fi",
+                "capacity_no_4_to_fi",
                 "fingrid_capacity_ee_fi",
             ],
+            combine="sum",
         )
+        capacity_import = self._coalesce_series(
+            [
+                market.get("jao_import_capacity_total"),
+                entsoe_import_capacity,
+            ],
+            feature_index,
+        ).ffill()
         features["available_import_headroom"] = capacity_import
         features["available_export_headroom"] = self._coalesce_columns(
             market,
             ["fingrid_capacity_fi_ee"],
         )
+        for column in [
+            "jao_import_capacity_se1_fi",
+            "jao_import_capacity_se3_fi",
+            "jao_import_capacity_ee_fi",
+            "jao_import_capacity_total",
+        ]:
+            if column in market.columns:
+                features[column] = market[column]
 
-        own_price_known = self._mask_known_series(own_prices.reindex(features.index), prediction_generated_at)
+        nuclear = market.get("fingrid_nuclear_production")
+        if nuclear is not None:
+            nuclear_known = self._mask_known_series(nuclear, prediction_generated_at).ffill()
+            features["fi_nuclear_available_mw"] = nuclear_known
+            features["market_nuclear_actual"] = nuclear_known
+
+        for column in [
+            "HydroPrecip_5d_median",
+            "HydroPrecip_5d_p10",
+            "HydroSWE_median",
+            "HydroSWE_p10",
+        ]:
+            if column in market.columns:
+                features[column] = market[column]
+
+        for column in market.columns:
+            if column.startswith("eu_ws_"):
+                features[column] = market[column]
+
+        own_prices = pd.to_numeric(own_prices.copy(), errors="coerce")
+        own_prices.index = self._ensure_utc_index(pd.DatetimeIndex(own_prices.index))
+        own_price_known = self._mask_known_series(own_prices, prediction_generated_at)
 
         # Autoregressive price lags — use 2d lag as the always-known safe lag.
         # lag_1d for D+1 slots maps to D+0 22:00–23:45 UTC, still future when model
@@ -532,6 +631,25 @@ class PricePredictor:
             result = result.combine_first(series)
         return result
 
+    def _coalesce_series(
+        self,
+        series_list: list[pd.Series | None],
+        index: pd.DatetimeIndex,
+    ) -> pd.Series:
+        result = pd.Series(index=index, dtype=float)
+        for series in series_list:
+            if series is None:
+                continue
+            candidate = pd.to_numeric(series.reindex(index), errors="coerce")
+            result = result.combine_first(candidate)
+        return result
+
+    def _ensure_utc_index(self, index: pd.DatetimeIndex) -> pd.DatetimeIndex:
+        result = pd.DatetimeIndex(index)
+        if result.tz is None:
+            return result.tz_localize("UTC")
+        return result.tz_convert("UTC")
+
     def _to_numeric_frame(self, frame: pd.DataFrame) -> pd.DataFrame:
         result = frame.copy()
         for column in result.columns:
@@ -546,7 +664,10 @@ class PricePredictor:
     def _align_prediction_features(self, frame: pd.DataFrame) -> pd.DataFrame:
         if not self.feature_columns:
             return frame
-        return frame.reindex(columns=self.feature_columns, fill_value=np.nan)
+        aligned = frame.reindex(columns=self.feature_columns, fill_value=np.nan)
+        if "structural_bias" in aligned.columns:
+            aligned["structural_bias"] = aligned["structural_bias"].fillna(1.0)
+        return aligned
 
     def _build_training_weights(self, index: pd.Index, train_end: datetime) -> pd.Series:
         timestamps = pd.DatetimeIndex(index)
@@ -619,11 +740,111 @@ class PricePredictor:
         best.update({"objective": "regression", "force_col_wise": True, "verbosity": -1, "seed": 42})
         return best
 
+    def _apply_low_wind_scaler(
+        self,
+        features: pd.DataFrame,
+        predictions: pd.DataFrame,
+        generated_at: datetime,
+    ) -> tuple[pd.DataFrame, pd.Series]:
+        multiplier = pd.Series(1.0, index=predictions.index, dtype=float)
+        if self.region.bidding_zone_entsoe != "FI" or "market_wind_forecast" not in features.columns:
+            return predictions, multiplier
+
+        wind = pd.to_numeric(features["market_wind_forecast"], errors="coerce")
+        if wind.dropna().empty:
+            return predictions, multiplier
+
+        threshold_low, threshold_high = self._low_wind_thresholds(generated_at, wind)
+        if threshold_low is None or threshold_high is None or threshold_high <= threshold_low:
+            return predictions, multiplier
+
+        wind_range = threshold_high - threshold_low
+        scaled = 1.0 + ((threshold_high - wind) / wind_range).clip(0.0, 1.0) * 0.30
+        scaled = scaled.clip(1.0, 1.30)
+
+        cutoff = pd.Timestamp(generated_at)
+        cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
+        future_mask = pd.Series(predictions.index > cutoff, index=predictions.index)
+        price_mask = pd.to_numeric(predictions["price"], errors="coerce").gt(0.0)
+        top_peak_mask = self._select_low_wind_scaler_rows(predictions["price"], future_mask)
+        apply_mask = future_mask & price_mask & top_peak_mask & scaled.gt(1.0)
+
+        if not apply_mask.any():
+            return predictions, multiplier
+
+        result = predictions.copy()
+        multiplier.loc[apply_mask] = scaled.loc[apply_mask]
+        result.loc[apply_mask, "price"] = result.loc[apply_mask, "price"] * multiplier.loc[apply_mask]
+        return result, multiplier
+
+    def _low_wind_thresholds(
+        self,
+        generated_at: datetime,
+        prediction_wind: pd.Series,
+    ) -> tuple[float | None, float | None]:
+        history = pd.Series(dtype=float)
+        cutoff = pd.Timestamp(generated_at)
+        cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
+
+        if self.traindata is not None and "market_wind_forecast" in self.traindata.columns:
+            train_wind = pd.to_numeric(self.traindata["market_wind_forecast"], errors="coerce")
+            train_wind.index = self._ensure_utc_index(pd.DatetimeIndex(train_wind.index))
+            history = train_wind.loc[:cutoff].dropna().tail(96 * 90)
+
+        if len(history) < 24:
+            candidate = pd.to_numeric(prediction_wind, errors="coerce")
+            candidate.index = self._ensure_utc_index(pd.DatetimeIndex(candidate.index))
+            history = candidate.loc[:cutoff].dropna()
+
+        if len(history) < 24:
+            history = pd.to_numeric(prediction_wind, errors="coerce").dropna()
+        if len(history) < 24:
+            return None, None
+
+        return float(history.quantile(0.15)), float(history.quantile(0.35))
+
+    def _select_low_wind_scaler_rows(self, prices: pd.Series, future_mask: pd.Series) -> pd.Series:
+        result = pd.Series(False, index=prices.index)
+        if prices.empty:
+            return result
+
+        local_index = prices.index.tz_convert("Europe/Helsinki")
+        local_hour = pd.Series(local_index.hour, index=prices.index)
+        local_date = pd.Series(local_index.date, index=prices.index)
+        morning_mask = local_hour.ge(6) & local_hour.lt(12)
+        evening_mask = local_hour.ge(16) & local_hour.lt(22)
+
+        for _, day_prices in prices.groupby(local_date):
+            candidate_mask = future_mask.reindex(day_prices.index, fill_value=False)
+            morning_prices = day_prices[candidate_mask & morning_mask.reindex(day_prices.index, fill_value=False)].dropna()
+            evening_prices = day_prices[candidate_mask & evening_mask.reindex(day_prices.index, fill_value=False)].dropna()
+            valid_count = len(morning_prices) + len(evening_prices)
+            if valid_count == 0:
+                continue
+
+            n_top = max(1, math.ceil(valid_count * 0.19))
+            n_morning = min(len(morning_prices), math.ceil(n_top / 2))
+            n_evening = min(len(evening_prices), n_top - n_morning)
+            if n_evening < len(evening_prices) and n_morning < math.ceil(n_top / 2):
+                n_evening = min(len(evening_prices), n_top - n_morning)
+            if n_morning + n_evening < n_top:
+                n_morning = min(len(morning_prices), n_morning + (n_top - n_morning - n_evening))
+
+            if n_morning > 0:
+                result.loc[morning_prices.nlargest(n_morning).index] = True
+            if n_evening > 0:
+                result.loc[evening_prices.nlargest(n_evening).index] = True
+
+        return result
+
     def _apply_post_model_blend(
         self,
         _: pd.DataFrame,
         predictions: pd.DataFrame,
         spike_probability: pd.Series | None = None,
+        generated_at: datetime | None = None,
+        feature_frame: pd.DataFrame | None = None,
+        scaler_multiplier: pd.Series | None = None,
     ) -> pd.DataFrame:
         weight = self.region.yesterday_blend_weight
         if weight <= 0.0 or self.pricestore.data.empty:
@@ -640,14 +861,58 @@ class PricePredictor:
         yesterday_baseline.index = result.index
         mask = yesterday_baseline.notna()
         if mask.any():
-            dynamic_weight = pd.Series(weight, index=result.index)
+            dynamic_weight = pd.Series(weight, index=result.index, dtype=float)
+            if self.region.bidding_zone_entsoe == "FI" and feature_frame is not None:
+                dynamic_weight = self._adjust_fi_blend_weight_for_feature_availability(
+                    dynamic_weight,
+                    feature_frame,
+                    generated_at,
+                )
+            if scaler_multiplier is not None and not scaler_multiplier.empty:
+                scaled_mask = scaler_multiplier.reindex(result.index).fillna(1.0).gt(1.0)
+                dynamic_weight.loc[scaled_mask] = dynamic_weight.loc[scaled_mask].clip(upper=0.10)
             if spike_probability is not None and not spike_probability.empty:
-                dynamic_weight = weight * (1.0 - spike_probability.clip(0.0, 1.0))
+                dynamic_weight = dynamic_weight * (1.0 - spike_probability.clip(0.0, 1.0))
             result.loc[mask, "price"] = (
                 result.loc[mask, "price"] * (1.0 - dynamic_weight.loc[mask])
                 + yesterday_baseline.loc[mask] * dynamic_weight.loc[mask]
             )
         return result
+
+    def _adjust_fi_blend_weight_for_feature_availability(
+        self,
+        dynamic_weight: pd.Series,
+        feature_frame: pd.DataFrame,
+        generated_at: datetime | None,
+    ) -> pd.Series:
+        critical_columns = [
+            "market_load_forecast",
+            "market_wind_forecast",
+            "available_import_headroom",
+            "fi_nuclear_available_mw",
+        ]
+        available_columns = [column for column in critical_columns if column in feature_frame.columns]
+        if not available_columns:
+            return dynamic_weight
+
+        result = dynamic_weight.copy()
+        available_count = feature_frame[available_columns].notna().sum(axis=1).reindex(result.index, fill_value=0)
+        weak_physical_inputs = available_count.lt(2)
+        if not weak_physical_inputs.any():
+            return result
+
+        if generated_at is None:
+            lead_hours = pd.Series(0.0, index=result.index)
+        else:
+            cutoff = pd.Timestamp(generated_at)
+            cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
+            lead_hours = pd.Series((result.index - cutoff).total_seconds() / 3600.0, index=result.index)
+
+        mid_horizon = weak_physical_inputs & lead_hours.ge(24.0)
+        far_horizon = weak_physical_inputs & lead_hours.ge(48.0)
+        result.loc[mid_horizon] = result.loc[mid_horizon].clip(lower=0.30)
+        result.loc[far_horizon] = result.loc[far_horizon].clip(lower=0.60)
+        return result.clip(0.0, 0.75)
 
     async def refresh_forecasts(self, start: datetime, end: datetime):
         """
