@@ -517,3 +517,42 @@ class TestRegionPriceManagerUpdateDataIfNeeded:
         assert manager.forecast_artifacts.save_latest.called
         assert manager.prediction_snapshots.append_predictions.call_args.args[3] == "test-version"
         assert manager.predictor_snapshots.append_frame.call_args.args[3]["model_version"] == "test-version"
+
+
+class TestRegionPriceManagerPersistenceRefresh:
+    @pytest.mark.asyncio
+    async def test_refresh_from_persistence_if_updated_reloads_prices_and_artifacts(self, sample_region):
+        manager = RegionPriceManager(sample_region)
+        manager.last_known_price = datetime(2025, 11, 1, tzinfo=timezone.utc)
+        manager.last_artifact_load = datetime(2025, 11, 1, tzinfo=timezone.utc)
+
+        newer = datetime(2025, 11, 1, 1, tzinfo=timezone.utc)
+        manager.forecast_artifacts.get_latest_update_time = MagicMock(return_value=newer)
+        manager.load_cached_artifacts = MagicMock(side_effect=lambda: setattr(manager, "last_artifact_load", newer))
+
+        manager.predictor.weatherstore.load_if_storage_updated = AsyncMock(return_value=False)
+        manager.predictor.entsoestore.load_if_storage_updated = AsyncMock(return_value=False)
+        manager.predictor.marketstore.load_if_storage_updated = AsyncMock(return_value=False)
+        manager.predictor.gasstore.load_if_storage_updated = AsyncMock(return_value=False)
+        manager.predictor.pricestore.load_if_storage_updated = AsyncMock(return_value=True)
+        manager.predictor.pricestore.get_last_known = MagicMock(return_value=newer)
+
+        await manager.refresh_from_persistence_if_updated()
+
+        assert manager.predictor.pricestore.load_if_storage_updated.called
+        assert manager.load_cached_artifacts.called
+        assert manager.last_known_price == newer
+
+    @pytest.mark.asyncio
+    async def test_ensure_loaded_refreshes_persistence_after_initial_load(self, sample_region):
+        manager = RegionPriceManager(sample_region)
+        manager.predictor.load_from_persistence = AsyncMock()
+        manager.load_cached_artifacts = MagicMock()
+        manager.refresh_from_persistence_if_updated = AsyncMock()
+
+        await manager.ensure_loaded()
+        await manager.ensure_loaded()
+
+        assert manager.predictor.load_from_persistence.await_count == 1
+        assert manager.load_cached_artifacts.call_count == 1
+        manager.refresh_from_persistence_if_updated.assert_awaited_once()

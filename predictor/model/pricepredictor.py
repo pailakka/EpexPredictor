@@ -10,7 +10,9 @@ from typing import Any, Dict, cast
 
 import lightgbm as lgb
 import numpy as np
+import optuna
 import pandas as pd
+from sklearn.linear_model import ElasticNet
 
 from .auxdatastore import AuxDataStore
 from .entsoedatastore import EntsoeDataStore
@@ -35,9 +37,8 @@ class PricePredictor:
     traindata: pd.DataFrame | None = None
 
     predictor: lgb.Booster | None = None
-    quantile_models: dict[str, lgb.Booster]
-    spike_classifier: lgb.Booster | None
-    spike_uplift_model: lgb.Booster | None
+    lear_model: ElasticNet | None = None
+    calibration_residuals: pd.Series | None = None
     model_version: str | None
     last_train_start: datetime | None
     last_train_end: datetime | None
@@ -52,9 +53,8 @@ class PricePredictor:
         self.marketstore = MarketFeatureStore(region, storage_dir)
         self.gasstore = GasPriceStore(region, storage_dir)
 
-        self.quantile_models = {}
-        self.spike_classifier = None
-        self.spike_uplift_model = None
+        self.lear_model = None
+        self.calibration_residuals = None
         self.model_version = None
         self.last_train_start = None
         self.last_train_end = None
@@ -90,7 +90,7 @@ class PricePredictor:
         self.gasstore = other.gasstore
 
     def is_trained(self) -> bool:
-        return self.predictor is not None
+        return self.predictor is not None and self.lear_model is not None
 
     async def train(self, start: datetime, end: datetime):
         self.traindata = await self.prepare_dataframe(start, end, prediction_generated_at=end)
@@ -111,49 +111,83 @@ class PricePredictor:
 
         self.feature_columns = params.columns.to_list()
 
+        # Use raw prices to preserve spike magnitude (no variance-stabilizing transform)
+        output_transformed = output
+
         weights = self._build_training_weights(params.index, end)
-        dataset = lgb.Dataset(params, label=output, weight=weights)
+        params = params.sort_index()
+        output_transformed = output_transformed.sort_index()
+        weights = weights.sort_index()
+
+        # Phase 1: LEAR structural baseline (lags + calendar + price-regime anchor)
+        # Including rolling_mean gives LEAR a price-level anchor so it doesn't need
+        # to reconstruct the current regime purely from 2d-ago prices.
+        structural_cols = [c for c in [
+            "own_price_lag_2d",
+            "own_price_lag_7d",
+            "own_price_rolling_mean_24h",
+            "weekday",
+            "hour_of_day",
+        ] if c in params.columns]
+        structural_params = params[structural_cols].fillna(0)
+        self.lear_model = ElasticNet(alpha=0.1, l1_ratio=0.5, fit_intercept=True)
+        self.lear_model.fit(structural_params, output_transformed, sample_weight=weights)
+        lear_predictions = pd.Series(self.lear_model.predict(structural_params), index=params.index)
+
+        cat_features = [c for c in ["weekday", "month"] if c in params.columns]
+
+        # Phase 2: LightGBM learns the nonlinear residual
+        residual_target = output_transformed - lear_predictions
+
+        # Temporal split: last 10% as held-out validation
+        split_idx = int(len(params) * 0.9)
+        if split_idx == 0 or split_idx == len(params):
+            train_set = lgb.Dataset(params, label=residual_target, weight=weights, categorical_feature=cat_features)
+            valid_sets = [train_set]
+            train_x, val_x = params, params
+            train_y, val_y = residual_target, residual_target
+            train_w = weights
+        else:
+            train_x, val_x = params.iloc[:split_idx], params.iloc[split_idx:]
+            train_y, val_y = residual_target.iloc[:split_idx], residual_target.iloc[split_idx:]
+            train_w, val_w = weights.iloc[:split_idx], weights.iloc[split_idx:]
+            train_set = lgb.Dataset(train_x, label=train_y, weight=train_w, categorical_feature=cat_features)
+            val_set = lgb.Dataset(val_x, label=val_y, weight=val_w, reference=train_set)
+            valid_sets = [train_set, val_set]
+
+
+        best_params = self._lgb_params()
+        if split_idx > 0:
+            try:
+                best_params = await asyncio.to_thread(
+                    self._optimize_hyperparameters, train_x, train_y, train_w, cat_features
+                )
+            except Exception as e:
+                log.warning("%s: Optuna optimization failed, using defaults: %s", self.region.bidding_zone_entsoe, e)
 
         self.predictor = await asyncio.to_thread(
             lgb.train,
-            params=self._lgb_params(),
-            train_set=dataset,
+            params=best_params,
+            train_set=train_set,
+            num_boost_round=1500,
+            valid_sets=valid_sets,
+            callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False)],
         )
 
+        # Phase 3: Conformal calibration from held-out validation errors
+        if split_idx > 0 and split_idx < len(params):
+            val_structural = val_x[structural_cols].fillna(0)
+            val_base = self.lear_model.predict(val_structural)
+            val_res = self.predictor.predict(val_x)
+            val_preds = val_base + val_res
+            self.calibration_residuals = pd.Series(np.abs(output_transformed.iloc[split_idx:] - val_preds))
+        else:
+            self.calibration_residuals = pd.Series([1.0])
+
+        # Keep legacy spike_classifier/quantile_models stubs so artifact store stays happy
         self.quantile_models = {}
         self.spike_classifier = None
         self.spike_uplift_model = None
-        if self.region.use_market_features:
-            for quantile_name, alpha in {"q10": 0.1, "q50": 0.5, "q90": 0.9}.items():
-                self.quantile_models[quantile_name] = await asyncio.to_thread(
-                    lgb.train,
-                    params=self._lgb_params(objective="quantile", alpha=alpha),
-                    train_set=lgb.Dataset(params, label=output, weight=weights),
-                )
-
-            spike_target = (output >= output.quantile(0.9)).astype(int)
-            if spike_target.sum() >= 48 and spike_target.nunique() > 1:
-                self.spike_classifier = await asyncio.to_thread(
-                    lgb.train,
-                    params=self._lgb_params(objective="binary"),
-                    train_set=lgb.Dataset(params, label=spike_target, weight=weights),
-                )
-
-                base_prediction = pd.Series(self.predictor.predict(params), index=params.index)
-                residual = output - base_prediction
-                spike_rows = spike_target.astype(bool)
-                if spike_rows.sum() >= 48:
-                    spike_params = params.loc[spike_rows]
-                    spike_weights = weights.loc[spike_rows]
-                    self.spike_uplift_model = await asyncio.to_thread(
-                        lgb.train,
-                        params=self._lgb_params(),
-                        train_set=lgb.Dataset(
-                            spike_params,
-                            label=residual.loc[spike_rows],
-                            weight=spike_weights,
-                        ),
-                    )
 
         self.model_version = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self.last_train_start = start
@@ -176,7 +210,7 @@ class PricePredictor:
         fill_known: bool = True,
         generated_at: datetime | None = None,
     ) -> dict[str, Any]:
-        assert self.is_trained() and self.predictor is not None
+        assert self.is_trained() and self.predictor is not None and self.lear_model is not None
 
         generation_time = generated_at or start
         df = await self.prepare_dataframe(start, end, prediction_generated_at=generation_time)
@@ -186,25 +220,37 @@ class PricePredictor:
         params = self._to_numeric_features(df.drop(columns=["price"]))
         params = self._align_prediction_features(params)
 
+        # LEAR structural baseline
+        structural_cols = [c for c in [
+            "own_price_lag_2d",
+            "own_price_lag_7d",
+            "own_price_rolling_mean_24h",
+            "weekday",
+            "hour_of_day",
+        ] if c in params.columns]
+        structural_params = params[structural_cols].fillna(0)
+        lear_preds = self.lear_model.predict(structural_params)
+
+        # LightGBM residual correction
+        res_preds = self.predictor.predict(params)
+        point_transformed = lear_preds + res_preds
+
         point_forecast = pd.DataFrame(index=params.index)
-        point_forecast["price"] = self.predictor.predict(params)
+        point_forecast["price"] = point_transformed
 
         spike_probability = pd.Series(0.0, index=params.index)
-        if self.spike_classifier is not None:
-            spike_probability = pd.Series(self.spike_classifier.predict(params), index=params.index)
-            if self.spike_uplift_model is not None:
-                uplift = pd.Series(self.spike_uplift_model.predict(params), index=params.index)
-                point_forecast["price"] = point_forecast["price"] + uplift * spike_probability.clip(0.0, 1.0)
 
+        # Conformal prediction intervals
         quantiles = pd.DataFrame(index=params.index)
-        if self.quantile_models:
-            for name, model in self.quantile_models.items():
-                quantiles[name] = model.predict(params)
-            quantiles["q50"] = quantiles["q50"] if "q50" in quantiles else point_forecast["price"]
-            if {"q10", "q50", "q90"} <= set(quantiles.columns):
-                quantiles["q10"] = np.minimum(quantiles["q10"], quantiles["q50"])
-                quantiles["q90"] = np.maximum(quantiles["q90"], quantiles["q50"])
-                point_forecast["price"] = point_forecast["price"] * 0.85 + quantiles["q50"] * 0.15
+        if self.calibration_residuals is not None and not self.calibration_residuals.empty:
+            q90_err = float(np.quantile(self.calibration_residuals, 0.90))
+            quantiles["q10"] = point_transformed - q90_err
+            quantiles["q90"] = point_transformed + q90_err
+            quantiles["q50"] = point_forecast["price"]
+        else:
+            quantiles["q50"] = point_forecast["price"]
+            quantiles["q10"] = point_forecast["price"] * 0.9
+            quantiles["q90"] = point_forecast["price"] * 1.1
 
         point_forecast = self._apply_post_model_blend(df, point_forecast, spike_probability)
 
@@ -249,6 +295,20 @@ class PricePredictor:
         )
 
         df = pd.concat([weather, auxdata], axis=1, sort=True)
+
+        # Cold-morning demand-spike interaction: colder temp × closer to morning peak.
+        # This is the primary driver of Finnish pre-dawn price spikes (06-09 EET) in
+        # spring/autumn — electric heating surges when temperatures drop unexpectedly.
+        if "temp_0" in df.columns and "morningpeak" in df.columns:
+            cold_factor = np.clip(15.0 - df["temp_0"], 0.0, 30.0)
+            morning_proximity = np.exp(-np.abs(df["morningpeak"]) / (2 * 3600))
+            df["cold_morning_peak"] = cold_factor * morning_proximity
+
+        # Evening cold interaction (19:00 EET demand peak)
+        if "temp_0" in df.columns and "eveningpeak" in df.columns:
+            cold_factor = np.clip(15.0 - df["temp_0"], 0.0, 30.0)
+            evening_proximity = np.exp(-np.abs(df["eveningpeak"]) / (2 * 3600))
+            df["cold_evening_peak"] = cold_factor * evening_proximity
 
         if self.region.use_entsoe_load_forecast:
             entsoedata = await self.entsoestore.get_data(start, end)
@@ -339,6 +399,48 @@ class PricePredictor:
         )
 
         own_price_known = self._mask_known_series(own_prices.reindex(features.index), prediction_generated_at)
+
+        # Autoregressive price lags — use 2d lag as the always-known safe lag.
+        # lag_1d for D+1 slots maps to D+0 22:00–23:45 UTC, still future when model
+        # runs at ~17:00 UTC → NaN → fillna(0) → LEAR baseline collapses to ~zero.
+        # lag_2d (same hour D-1) is fully known at any realistic forecast time.
+        features["own_price_lag_2d"] = self._lag_to_index(own_price_known, features.index, timedelta(days=2))
+        features["own_price_lag_7d"] = self._lag_to_index(own_price_known, features.index, timedelta(days=7))
+
+        # Rolling statistics on the 2d lag
+        lag_2d = features["own_price_lag_2d"]
+        features["own_price_rolling_mean_24h"] = lag_2d.rolling(96, min_periods=24).mean()
+        features["own_price_rolling_max_24h"] = lag_2d.rolling(96, min_periods=24).max()
+        features["own_price_rolling_min_24h"] = lag_2d.rolling(96, min_periods=24).min()
+        # 3-day rolling mean as a slower price-regime indicator
+        features["own_price_rolling_mean_72h"] = lag_2d.rolling(96 * 3, min_periods=48).mean()
+
+        # Normalised residual load: deviation from 7-day rolling baseline normalised by std.
+        # Raw load in MW has a spurious negative coefficient (high load ≈ winter ≈ lower wind),
+        # but load deviation from normal (cold snap, workday peak) directly pressures price.
+        load_baseline = load.rolling(96 * 7, min_periods=96).mean()
+        load_std = load.rolling(96 * 7, min_periods=96).std().replace(0, np.nan)
+        features["load_deviation_norm"] = (load - load_baseline) / load_std
+
+        # Wind ramp: how much the forecasted wind changed vs. 24h ago (sudden drought → price spike).
+        wind_24h_ago = self._lag_to_index(wind, features.index, timedelta(hours=24))
+        features["wind_ramp_24h"] = wind - wind_24h_ago
+
+        # Load ramp
+        load_24h_ago = self._lag_to_index(load, features.index, timedelta(hours=24))
+        features["load_ramp_24h"] = load - load_24h_ago
+
+        features["market_residual_load_ramp_3h"] = features["market_residual_load"].diff(periods=12)
+
+        # Renewable penetration & thermal burden
+        features["market_renewable_penetration"] = (wind + solar) / load.replace(0, np.nan)
+        features["market_thermal_burden"] = load - wind - solar - capacity_import
+
+        # Explicit spatial cross-border features
+        for col in market.columns:
+            if col.startswith("capacity_"):
+                features[col] = market[col]
+
         state_sources = {
             "imbalance_long": market.get("imbalance_prices_long"),
             "imbalance_short": market.get("imbalance_prices_short"),
@@ -358,7 +460,9 @@ class PricePredictor:
             if column not in market.columns:
                 continue
             shadow_price = self._mask_known_series(market[column], prediction_generated_at)
-            features[f"{column}_lag_1d"] = self._lag_to_index(shadow_price, features.index, timedelta(days=1))
+            # Use lag_2d (not lag_1d) — same masking reason as own_price_lag.
+            # lag_1d for D+1 slots maps back to D+0 which isn't published yet.
+            features[f"{column}_lag_2d"] = self._lag_to_index(shadow_price, features.index, timedelta(days=2))
             shadow_spread = shadow_price - own_price_known
             self._append_state_features(features, f"{column}_spread", shadow_spread, prediction_generated_at)
 
@@ -449,7 +553,10 @@ class PricePredictor:
         train_end_ts = pd.Timestamp(train_end)
         train_end_ts = train_end_ts.tz_localize("UTC") if train_end_ts.tzinfo is None else train_end_ts.tz_convert("UTC")
         age_days = (train_end_ts - timestamps).total_seconds() / (24 * 60 * 60)
-        decay_days = 90.0 if self.region.use_market_features else 180.0
+        # 180-day half-life: focuses the model on the recent price regime (spring 2026)
+        # while still retaining a full year of seasonal signal via the long history window.
+        # Winter 2025 data with different price levels gets downweighted ~7x vs. last month.
+        decay_days = 180.0
         weights = np.exp(-age_days / decay_days)
         return pd.Series(weights, index=timestamps)
 
@@ -462,10 +569,55 @@ class PricePredictor:
             "feature_fraction_seed": 42,
             "bagging_seed": 42,
             "data_random_seed": 42,
+            "learning_rate": 0.05,
         }
         if alpha is not None:
             params["alpha"] = alpha
         return params
+
+    def _optimize_hyperparameters(
+        self,
+        train_x: pd.DataFrame,
+        train_y: pd.Series,
+        train_w: pd.Series,
+        cat_features: list[str],
+    ) -> dict[str, Any]:
+        def objective(trial: optuna.Trial) -> float:
+            param = {
+                "objective": "regression",
+                "force_col_wise": True,
+                "verbosity": -1,
+                "seed": 42,
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+                "num_leaves": trial.suggest_int("num_leaves", 20, 100),
+                "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
+                "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
+                "bagging_freq": trial.suggest_int("bagging_freq", 1, 7),
+                "lambda_l1": trial.suggest_float("lambda_l1", 1e-8, 10.0, log=True),
+                "lambda_l2": trial.suggest_float("lambda_l2", 1e-8, 10.0, log=True),
+            }
+            split_idx = int(len(train_x) * 0.8)
+            cv_tx, cv_vx = train_x.iloc[:split_idx], train_x.iloc[split_idx:]
+            cv_ty, cv_vy = train_y.iloc[:split_idx], train_y.iloc[split_idx:]
+            cv_tw = train_w.iloc[:split_idx]
+            cv_vw = train_w.iloc[split_idx:]
+            cv_train = lgb.Dataset(cv_tx, label=cv_ty, weight=cv_tw, categorical_feature=cat_features)
+            cv_val = lgb.Dataset(cv_vx, label=cv_vy, weight=cv_vw, reference=cv_train)
+            gbm = lgb.train(
+                param, cv_train,
+                num_boost_round=800,
+                valid_sets=[cv_val],
+                callbacks=[lgb.early_stopping(30, verbose=False)],
+            )
+            preds = gbm.predict(cv_vx)
+            return float(np.mean(np.abs(preds - cv_vy)))
+
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        study = optuna.create_study(direction="minimize")
+        study.optimize(objective, n_trials=8, timeout=120)
+        best = study.best_params
+        best.update({"objective": "regression", "force_col_wise": True, "verbosity": -1, "seed": 42})
+        return best
 
     def _apply_post_model_blend(
         self,
@@ -514,14 +666,10 @@ class PricePredictor:
         self.marketstore.drop_before(cutoff)
         self.gasstore.drop_before(cutoff)
 
-    def get_model_artifacts(self) -> dict[str, lgb.Booster]:
-        artifacts: dict[str, lgb.Booster] = {}
+    def get_model_artifacts(self) -> dict[str, Any]:
+        artifacts: dict[str, Any] = {}
         if self.predictor is not None:
             artifacts["point"] = self.predictor
-        for name, model in self.quantile_models.items():
-            artifacts[name] = model
-        if self.spike_classifier is not None:
-            artifacts["spike_classifier"] = self.spike_classifier
-        if self.spike_uplift_model is not None:
-            artifacts["spike_uplift"] = self.spike_uplift_model
+        if self.lear_model is not None:
+            artifacts["lear_baseline"] = self.lear_model
         return artifacts

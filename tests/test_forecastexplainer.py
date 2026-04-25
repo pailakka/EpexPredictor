@@ -147,6 +147,25 @@ class TestForecastExplainer:
         assert explanation["adjustments"]
         assert explanation["reconciliation_error"] == pytest.approx(0.0, abs=1e-6)
 
+    def test_explain_row_uses_yesterday_known_price_for_blend_reconciliation(self, temp_storage_dir):
+        explainer, merged = train_bundle(temp_storage_dir)
+
+        row = merged.iloc[0].copy()
+        row["yesterday_known_price"] = float(row["price_lag_1d"]) + 3.0
+
+        explanation = explainer.explain_row(row)
+        bundle = explainer._load_bundle(str(row["model_version"]))
+        features = explainer._prepare_feature_matrix(pd.DataFrame([row.to_dict()]), bundle.feature_names)
+        spike_probability = float(bundle.spike_classifier.predict(features)[0])
+        expected_blend = row["yesterday_known_price"] * explainer.region.yesterday_blend_weight * (1.0 - spike_probability)
+        blend_item = next(
+            item for item in explanation["adjustments"]
+            if item["adjustment_name"] == "yesterday_blend_component"
+        )
+
+        assert explanation["explainable"] is True
+        assert blend_item["signed_contribution"] == pytest.approx(expected_blend, abs=1e-6)
+
     def test_grouped_contributions_match_feature_total(self, temp_storage_dir):
         explainer, merged = train_bundle(temp_storage_dir)
 
@@ -187,6 +206,7 @@ class TestForecastExplainer:
 
         assert result.empty
         assert "actual_price" in result.columns
+        assert "yesterday_known_price" in result.columns
         assert "explainable" in result.columns
         assert "explainable_reason" in result.columns
 
@@ -215,3 +235,30 @@ class TestForecastExplainer:
 
         for item in explanation["feature_contributions"]:
             assert feature_group_for(item["feature_name"]) in FEATURE_GROUP_LABELS
+
+    def test_feature_group_for_current_fi_feature_families(self):
+        expected_groups = {
+            "weekday": "time_calendar",
+            "month": "time_calendar",
+            "day_of_year": "time_calendar",
+            "hour_of_day": "time_calendar",
+            "hour_of_week": "time_calendar",
+            "cold_morning_peak": "time_calendar",
+            "cold_evening_peak": "time_calendar",
+            "own_price_lag_2d": "persistence",
+            "own_price_lag_7d": "persistence",
+            "own_price_rolling_mean_24h": "persistence",
+            "own_price_rolling_max_24h": "persistence",
+            "own_price_rolling_min_24h": "persistence",
+            "own_price_rolling_mean_72h": "persistence",
+            "load_deviation_norm": "demand_load",
+            "load_ramp_24h": "demand_load",
+            "market_residual_load_ramp_3h": "demand_load",
+            "market_thermal_burden": "demand_load",
+            "wind_ramp_24h": "renewables",
+            "market_renewable_penetration": "renewables",
+            "gasprice": "gas_other",
+        }
+
+        for feature_name, expected_group in expected_groups.items():
+            assert feature_group_for(feature_name) == expected_group

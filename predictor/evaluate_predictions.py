@@ -7,8 +7,9 @@ import asyncio
 import json
 import math
 import os
+import sys
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -18,6 +19,19 @@ from predictor.model.priceregion import PriceRegion, PriceRegionName
 
 PREDICTION_HORIZON_DAYS = 7
 DEFAULT_STORAGE_DIR = os.getenv("EPEXPREDICTOR_DATADIR", "./data")
+ProgressReporter = Callable[[str], None]
+
+
+def emit_progress(progress: ProgressReporter | None, message: str) -> None:
+    if progress is not None:
+        progress(message)
+
+
+def make_stderr_progress_reporter() -> ProgressReporter:
+    def _report(message: str) -> None:
+        print(message, file=sys.stderr, flush=True)
+
+    return _report
 
 
 def to_utc_timestamp(value: datetime) -> pd.Timestamp:
@@ -179,9 +193,15 @@ async def preload_backtest_data(
     generation_start: datetime,
     eval_end: datetime,
     training_window_days: int,
+    progress: ProgressReporter | None = None,
 ) -> None:
     data_start = generation_start - timedelta(days=training_window_days)
     data_end = eval_end + timedelta(days=PREDICTION_HORIZON_DAYS)
+    emit_progress(
+        progress,
+        f"Preloading backtest inputs for {to_utc_timestamp(data_start).isoformat()} -> "
+        f"{to_utc_timestamp(data_end).isoformat()}",
+    )
     await asyncio.gather(
         predictor.weatherstore.get_data(data_start, data_end),
         predictor.pricestore.get_data(data_start, data_end),
@@ -190,6 +210,7 @@ async def preload_backtest_data(
         predictor.auxstore.get_data(data_start, data_end),
         predictor.gasstore.get_data(data_start, data_end),
     )
+    emit_progress(progress, "Backtest input preload complete")
 
 
 async def generate_backtest_predictions(
@@ -198,18 +219,38 @@ async def generate_backtest_predictions(
     eval_end: datetime,
     training_window_days: int,
     storage_dir: str | None,
+    progress: ProgressReporter | None = None,
 ) -> pd.DataFrame:
     generation_start = eval_start - timedelta(days=PREDICTION_HORIZON_DAYS)
     predictor = await PricePredictor(region, storage_dir).load_from_persistence()
-    await preload_backtest_data(predictor, generation_start, eval_end, training_window_days)
+    await preload_backtest_data(
+        predictor,
+        generation_start,
+        eval_end,
+        training_window_days,
+        progress=progress,
+    )
 
     all_predictions: list[pd.DataFrame] = []
+    total_generations = 0
+    generation_cursor = generation_start
+    while generation_cursor <= eval_end:
+        total_generations += 1
+        generation_cursor += timedelta(days=1)
+
     generated_at = generation_start
+    iteration = 0
     while generated_at <= eval_end:
+        iteration += 1
         train_start = generated_at - timedelta(days=training_window_days)
         train_end = generated_at - timedelta(minutes=15)
         prediction_end = generated_at + timedelta(days=PREDICTION_HORIZON_DAYS)
 
+        emit_progress(
+            progress,
+            f"[{iteration}/{total_generations}] Training backtest model for "
+            f"{to_utc_timestamp(generated_at).isoformat()}",
+        )
         predictor.pricestore.horizon_cutoff = generated_at
         predictor.gasstore.horizon_cutoff = generated_at
         await predictor.train(train_start, train_end)
@@ -232,9 +273,19 @@ async def generate_backtest_predictions(
                 (snapshot["target_time_utc"] - generated_at_ts).dt.total_seconds() / 60.0
             ).round().astype(int)
             snapshot["region"] = region.bidding_zone_entsoe
+            snapshot["model_version"] = predictor.model_version
             snapshot["train_start_utc"] = train_start
             snapshot["train_end_utc"] = train_end
             all_predictions.append(snapshot)
+            emit_progress(
+                progress,
+                f"[{iteration}/{total_generations}] Generated {len(snapshot)} prediction rows",
+            )
+        else:
+            emit_progress(
+                progress,
+                f"[{iteration}/{total_generations}] Generated 0 prediction rows",
+            )
 
         generated_at += timedelta(days=1)
 
@@ -248,6 +299,11 @@ async def generate_backtest_predictions(
         (combined["target_time_utc"] >= eval_start_ts)
         & (combined["target_time_utc"] <= eval_end_ts)
     ]
+    if "model_version" not in combined.columns:
+        combined["model_version"] = pd.Series(pd.NA, index=combined.index, dtype="string")
+    else:
+        combined["model_version"] = combined["model_version"].astype("string")
+    emit_progress(progress, f"Backtest generation complete: {len(combined)} rows in evaluation window")
     return combined[PredictionSnapshotStore.required_columns]
 
 
@@ -286,10 +342,18 @@ async def evaluate_predictions(
     storage_dir: str | None,
     source: str,
     primary_window_only: bool,
+    progress: ProgressReporter | None = None,
 ) -> dict[str, Any]:
+    emit_progress(
+        progress,
+        f"Loading actual prices for {to_utc_timestamp(eval_start).isoformat()} -> "
+        f"{to_utc_timestamp(eval_end).isoformat()}",
+    )
     actual_prices = await load_actual_prices(region, storage_dir, eval_start, eval_end)
     if source == "snapshots":
+        emit_progress(progress, "Loading stored snapshot predictions")
         predictions = load_snapshot_predictions(region, storage_dir, eval_start, eval_end)
+        emit_progress(progress, f"Loaded {len(predictions)} snapshot prediction rows")
     else:
         predictions = await generate_backtest_predictions(
             region,
@@ -297,11 +361,14 @@ async def evaluate_predictions(
             eval_end,
             training_window_days,
             storage_dir,
+            progress=progress,
         )
 
+    emit_progress(progress, "Building evaluation frame")
     frame = build_evaluation_frame(predictions, actual_prices, region)
     if primary_window_only:
         frame = frame[frame["generated_at_window"] == "primary_window"].copy()
+    emit_progress(progress, f"Evaluation frame contains {len(frame)} rows")
     report = summarize_evaluation(frame)
     report.update(
         {
@@ -391,6 +458,7 @@ async def main() -> None:
     eval_start = datetime.fromisoformat(args.eval_start.replace("Z", "+00:00"))
     eval_end = datetime.fromisoformat(args.eval_end.replace("Z", "+00:00"))
     region = PriceRegionName(args.region).to_region()
+    progress = make_stderr_progress_reporter()
 
     report = await evaluate_predictions(
         region,
@@ -400,6 +468,7 @@ async def main() -> None:
         args.storage_dir,
         args.source,
         args.primary_window_only,
+        progress=progress,
     )
 
     if args.output_format == "json":

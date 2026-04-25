@@ -174,8 +174,51 @@ class MarketFeatureStore(DataStore):
             calls.append(
                 (
                     f"shadow_price_{shadow_area.lower()}",
-                    lambda shadow_area=shadow_area: client.query_day_ahead_prices(
-                        shadow_area,
+                    lambda sa=shadow_area: client.query_day_ahead_prices(
+                        sa,
+                        start=qstart,
+                        end=qend,
+                    ),
+                )
+            )
+            calls.append(
+                (
+                    f"shadow_wind_{shadow_area.lower()}",
+                    lambda sa=shadow_area: client.query_wind_and_solar_forecast(
+                        sa,
+                        start=qstart,
+                        end=qend,
+                    ),
+                )
+            )
+            calls.append(
+                (
+                    f"shadow_load_{shadow_area.lower()}",
+                    lambda sa=shadow_area: client.query_load_forecast(
+                        sa,
+                        start=qstart,
+                        end=qend,
+                        process_type="A01",
+                    ),
+                )
+            )
+            calls.append(
+                (
+                    f"capacity_fi_to_{shadow_area.lower()}",
+                    lambda sa=shadow_area: client.query_net_transfer_capacity_dayahead(
+                        "FI",
+                        sa,
+                        start=qstart,
+                        end=qend,
+                    ),
+                )
+            )
+            calls.append(
+                (
+                    f"capacity_{shadow_area.lower()}_to_fi",
+                    lambda sa=shadow_area: client.query_net_transfer_capacity_dayahead(
+                        sa,
+                        "FI",
                         start=qstart,
                         end=qend,
                     ),
@@ -205,7 +248,10 @@ class MarketFeatureStore(DataStore):
             return pd.DataFrame()
 
         now = datetime.now(timezone.utc)
-        if self.last_fingrid_refresh is not None and now - self.last_fingrid_refresh < self.FINGRID_REFRESH_COOLDOWN:
+
+        # Use file mtime as a persistent cooldown so restarts don't bypass the limit
+        effective_last_refresh = self.last_fingrid_refresh or self.get_storage_mtime()
+        if effective_last_refresh is not None and now - effective_last_refresh < self.FINGRID_REFRESH_COOLDOWN:
             return pd.DataFrame()
 
         query_window_start = now - timedelta(days=self.FINGRID_HISTORY_LOOKBACK_DAYS)

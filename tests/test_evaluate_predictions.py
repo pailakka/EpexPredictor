@@ -3,9 +3,12 @@
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+import pytest
 
+import predictor.evaluate_predictions as evaluate_predictions_module
 from predictor.evaluate_predictions import (
     build_evaluation_frame,
+    generate_backtest_predictions,
     load_snapshot_predictions,
     render_text_report,
     summarize_evaluation,
@@ -16,6 +19,63 @@ from predictor.model.priceregion import PriceRegionName
 
 class TestEvaluatePredictions:
     """Tests for snapshot-backed prediction evaluation."""
+
+    @pytest.mark.asyncio
+    async def test_generate_backtest_predictions_includes_model_version_and_reports_progress(self, monkeypatch):
+        region = PriceRegionName.FI.to_region()
+
+        class DummyDataStore:
+            def __init__(self):
+                self.horizon_cutoff = None
+
+            async def get_data(self, *_args, **_kwargs):
+                return pd.DataFrame()
+
+        class DummyPredictor:
+            def __init__(self, predictor_region, storage_dir):
+                self.region = predictor_region
+                self.storage_dir = storage_dir
+                self.weatherstore = DummyDataStore()
+                self.pricestore = DummyDataStore()
+                self.entsoestore = DummyDataStore()
+                self.marketstore = DummyDataStore()
+                self.auxstore = DummyDataStore()
+                self.gasstore = DummyDataStore()
+                self.model_version = None
+
+            async def load_from_persistence(self):
+                return self
+
+            async def train(self, _start, end):
+                generated_at = end + timedelta(minutes=15)
+                self.model_version = f"version-{generated_at.strftime('%Y%m%dT%H%M%SZ')}"
+
+            async def predict(self, start, _end, fill_known=True, generated_at=None):
+                assert fill_known is False
+                assert generated_at == start
+                index = pd.DatetimeIndex([pd.Timestamp(start) + timedelta(days=1)])
+                return pd.DataFrame({"price": [42.0]}, index=index)
+
+        monkeypatch.setattr(evaluate_predictions_module, "PricePredictor", DummyPredictor)
+        monkeypatch.setattr(evaluate_predictions_module, "PREDICTION_HORIZON_DAYS", 1)
+
+        progress_messages: list[str] = []
+        predictions = await generate_backtest_predictions(
+            region,
+            datetime(2026, 4, 2, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 4, 3, 0, 0, tzinfo=timezone.utc),
+            training_window_days=120,
+            storage_dir=None,
+            progress=progress_messages.append,
+        )
+
+        assert predictions["model_version"].tolist() == [
+            "version-20260401T000000Z",
+            "version-20260402T000000Z",
+        ]
+        assert any("Preloading backtest inputs" in message for message in progress_messages)
+        assert any("[1/3] Training backtest model" in message for message in progress_messages)
+        assert progress_messages[-1] == "Backtest generation complete: 2 rows in evaluation window"
 
     def test_snapshot_history_report_contains_baselines_and_buckets(self, temp_storage_dir):
         region = PriceRegionName.FI.to_region()

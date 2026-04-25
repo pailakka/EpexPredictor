@@ -38,6 +38,12 @@ class ForecastArtifactStore:
             return None
         return f"{base_dir}/forecast_latest_metadata_v1_{self.region.bidding_zone_entsoe}.json"
 
+    def get_latest_update_time(self) -> datetime | None:
+        metadata_path = self._metadata_path()
+        if metadata_path is None or not os.path.exists(metadata_path):
+            return None
+        return datetime.fromtimestamp(os.path.getmtime(metadata_path), tz=timezone.utc)
+
     def _model_dir(self, version: str) -> str | None:
         base_dir = self._ensure_storage_dir()
         if base_dir is None:
@@ -103,6 +109,8 @@ class ForecastArtifactStore:
         for name, model in models.items():
             if model is None:
                 continue
+            if not hasattr(model, "save_model"):
+                continue  # skip sklearn / non-LightGBM artifacts
             path = f"{model_dir}/{name}.txt"
             model.save_model(path)
             files[name] = path

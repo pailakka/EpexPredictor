@@ -18,10 +18,13 @@ import pandas as pd
 from datetime import datetime, timezone
 
 from predictor.evaluate_predictions import (
+    ProgressReporter,
     build_evaluation_frame,
+    emit_progress,
     generate_backtest_predictions,
     load_actual_prices,
     load_snapshot_predictions,
+    make_stderr_progress_reporter,
     metric_summary,
 )
 from predictor.model.priceregion import PriceRegion, PriceRegionName
@@ -199,6 +202,7 @@ async def load_predictions(
     eval_end: datetime,
     storage_dir: str | None,
     training_window_days: int,
+    progress: ProgressReporter | None = None,
 ) -> pd.DataFrame:
     if source == "backtest":
         return await generate_backtest_predictions(
@@ -207,8 +211,12 @@ async def load_predictions(
             eval_end,
             training_window_days,
             storage_dir,
+            progress=progress,
         )
-    return load_snapshot_predictions(region, storage_dir, eval_start, eval_end)
+    emit_progress(progress, "Loading stored snapshot predictions")
+    predictions = load_snapshot_predictions(region, storage_dir, eval_start, eval_end)
+    emit_progress(progress, f"Loaded {len(predictions)} snapshot prediction rows")
+    return predictions
 
 
 async def generate_snapshot_plot(
@@ -225,7 +233,9 @@ async def generate_snapshot_plot(
     height: int,
     transparent: bool,
     timezone_name: str | None,
+    progress: ProgressReporter | None = None,
 ) -> dict[str, Any]:
+    emit_progress(progress, f"Preparing {source} plot for {region.bidding_zone_entsoe}")
     predictions = await load_predictions(
         source,
         region,
@@ -233,6 +243,7 @@ async def generate_snapshot_plot(
         eval_end,
         storage_dir,
         training_window_days,
+        progress=progress,
     )
     if predictions.empty:
         if source == "backtest":
@@ -243,7 +254,9 @@ async def generate_snapshot_plot(
             f"{Path(storage_dir or DEFAULT_STORAGE_DIR) / f'prediction_snapshots_v1_{region.bidding_zone_entsoe}.csv.gz'}."
         )
 
+    emit_progress(progress, "Loading actual prices for plotting")
     actual_prices = await load_actual_prices(region, storage_dir, eval_start, eval_end)
+    emit_progress(progress, "Building evaluation frame for plotting")
     evaluation_frame = build_evaluation_frame(predictions, actual_prices, region)
     if evaluation_frame.empty:
         if source == "backtest":
@@ -265,6 +278,7 @@ async def generate_snapshot_plot(
             f"Selection={selection}, generated_at_window={generated_at_window}."
         )
 
+    emit_progress(progress, f"Rendering plot with {len(selected_frame)} rows")
     metrics = render_snapshot_plot(
         selected_frame,
         region,
@@ -277,6 +291,7 @@ async def generate_snapshot_plot(
         transparent,
         timezone_name,
     )
+    emit_progress(progress, f"Plot written to {Path(output_file).resolve()}")
     return {
         "output_file": str(Path(output_file).resolve()),
         "rows_plotted": int(len(selected_frame)),
@@ -321,6 +336,7 @@ async def main() -> None:
     eval_start = datetime.fromisoformat(args.eval_start.replace("Z", "+00:00"))
     eval_end = datetime.fromisoformat(args.eval_end.replace("Z", "+00:00"))
     region = PriceRegionName(args.region).to_region()
+    progress = make_stderr_progress_reporter()
 
     try:
         result = await generate_snapshot_plot(
@@ -337,6 +353,7 @@ async def main() -> None:
             args.height,
             args.transparent,
             args.timezone,
+            progress=progress,
         )
     except ValueError as exc:
         raise SystemExit(str(exc))

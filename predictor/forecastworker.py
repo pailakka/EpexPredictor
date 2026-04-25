@@ -43,10 +43,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-async def refresh_regions(region_names: list[PriceRegionName], force: bool) -> None:
-    for region_name in region_names:
-        manager = RegionPriceManager(region_name.to_region())
-        await manager.ensure_loaded()
+async def refresh_regions(managers: list[tuple[PriceRegionName, RegionPriceManager]], force: bool) -> None:
+    for region_name, manager in managers:
         log.info("%s: worker refresh started", region_name.value)
         await manager.update_data_if_needed(force=force)
         log.info("%s: worker refresh finished", region_name.value)
@@ -54,11 +52,18 @@ async def refresh_regions(region_names: list[PriceRegionName], force: bool) -> N
 
 async def main() -> None:
     args = parse_args()
-    regions = [PriceRegionName(name.strip()) for name in args.regions.split(",") if name.strip()]
+    region_names = [PriceRegionName(name.strip()) for name in args.regions.split(",") if name.strip()]
+
+    # Create managers once so in-memory state (cooldowns, caches) persists across cycles
+    managers: list[tuple[PriceRegionName, RegionPriceManager]] = []
+    for region_name in region_names:
+        manager = RegionPriceManager(region_name.to_region())
+        await manager.ensure_loaded()
+        managers.append((region_name, manager))
 
     while True:
         cycle_started = datetime.now(timezone.utc)
-        await refresh_regions(regions, force=args.force)
+        await refresh_regions(managers, force=args.force)
         if args.once:
             return
 

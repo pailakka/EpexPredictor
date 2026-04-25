@@ -82,6 +82,7 @@ class ForecastExplainer:
             "model_version": pd.Series(dtype="string"),
             "predicted_price": pd.Series(dtype=float),
             "actual_price": pd.Series(dtype=float),
+            "yesterday_known_price": pd.Series(dtype=float),
             "explainable": pd.Series(dtype=bool),
             "explainable_reason": pd.Series(dtype="object"),
         }
@@ -181,6 +182,9 @@ class ForecastExplainer:
             actual_series = actual_prices["price"].sort_index()
 
         merged["actual_price"] = actual_series.reindex(merged["target_time_utc"]).to_numpy()
+        merged["yesterday_known_price"] = actual_series.reindex(
+            pd.DatetimeIndex(merged["target_time_utc"]) - pd.Timedelta(days=1)
+        ).to_numpy()
         merged["explainable"] = merged["model_version"].notna()
         merged["explainable_reason"] = None
         merged.loc[~merged["explainable"], "explainable_reason"] = (
@@ -309,8 +313,17 @@ class ForecastExplainer:
                     uplift * spike_probability.clip(0.0, 1.0) * preblend_scale
                 )
 
-            if self.region.yesterday_blend_weight > 0.0 and "price_lag_1d" in version_features.columns:
-                yesterday = pd.to_numeric(version_features["price_lag_1d"], errors="coerce")
+            if self.region.yesterday_blend_weight > 0.0:
+                yesterday_source = version_frame.get("yesterday_known_price")
+                if yesterday_source is None:
+                    yesterday = pd.Series(float("nan"), index=version_frame.index, dtype=float)
+                else:
+                    yesterday = pd.to_numeric(yesterday_source, errors="coerce")
+                if yesterday.isna().all():
+                    if "price_lag_1d" in version_features.columns:
+                        yesterday = pd.to_numeric(version_features["price_lag_1d"], errors="coerce")
+                    else:
+                        yesterday = pd.Series(float("nan"), index=version_frame.index, dtype=float)
                 blend_weight = self.region.yesterday_blend_weight * (1.0 - spike_probability.clip(0.0, 1.0))
                 blend_weight = blend_weight.where(yesterday.notna(), 0.0)
                 scale = 1.0 - blend_weight
@@ -767,22 +780,38 @@ class ForecastExplainer:
 
 
 def feature_group_for(feature_name: str) -> str:
+    if feature_name in {
+        "wind_ramp_24h",
+        "market_renewable_penetration",
+    }:
+        return "renewables"
     if feature_name.startswith(("wind_", "temp_", "irradiance_", "pressure_", "humidity_")):
         return "weather"
     if feature_name in {
         "holiday",
+        "weekday",
+        "month",
+        "day_of_year",
+        "hour_of_day",
+        "hour_of_week",
         "sunelevation",
         "azimuth",
         "sr_influence",
         "ss_influence",
         "morningpeak",
         "eveningpeak",
+        "cold_morning_peak",
+        "cold_evening_peak",
     } or feature_name.startswith("day_"):
         return "time_calendar"
     if feature_name in {
         "load",
         "market_load_forecast",
         "market_residual_load",
+        "load_deviation_norm",
+        "load_ramp_24h",
+        "market_residual_load_ramp_3h",
+        "market_thermal_burden",
         "boiler_consumption_recent",
         "boiler_consumption_recent_mean_24h",
         "boiler_consumption_recent_std_24h",
@@ -801,6 +830,8 @@ def feature_group_for(feature_name: str) -> str:
         return "imbalance_state"
     if feature_name.startswith("shadow_price_"):
         return "coupled_market"
-    if feature_name.startswith("price_lag_") or feature_name.startswith("price_roll_"):
+    if feature_name.startswith(("price_lag_", "price_roll_", "own_price_")):
         return "persistence"
+    if feature_name.startswith("gas"):
+        return "gas_other"
     return "gas_other"

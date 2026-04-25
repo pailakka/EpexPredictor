@@ -163,6 +163,27 @@ class TestDataStoreUpdateData:
         # Should not have duplicates
         assert len(store.data) == len(df)
 
+    def test_update_data_preserves_partially_populated_rows(self, sample_region):
+        """Test that rows with at least one populated column are retained."""
+        store = ConcreteDataStore(sample_region)
+
+        dates = pd.date_range(start="2025-01-01", periods=3, freq="15min", tz="UTC")
+        df = pd.DataFrame(
+            {
+                "value": [1.0, None, 3.0],
+                "other": [None, 2.0, None],
+            },
+            index=dates,
+        )
+        df.index.name = "time"
+
+        store._update_data(df)
+
+        assert len(store.data) == 3
+        assert store.data.loc[dates[0], "value"] == pytest.approx(1.0)
+        assert store.data.loc[dates[1], "other"] == pytest.approx(2.0)
+        assert store.data.loc[dates[2], "value"] == pytest.approx(3.0)
+
 
 class TestDataStoreSerialization:
     """Tests for serialize and load methods."""
@@ -444,3 +465,54 @@ class TestDataStorePersistenceEdgeCases:
         store3 = await ConcreteDataStore(sample_region, temp_storage_dir, "test").load()
         assert len(store3.data) == 3
         assert store3.data["value"].tolist() == [100, 200, 300]
+
+    @pytest.mark.asyncio
+    async def test_load_if_storage_updated_reloads_newer_file(self, sample_region, temp_storage_dir):
+        """Test load_if_storage_updated refreshes memory when the persisted file changes."""
+        store = ConcreteDataStore(sample_region, temp_storage_dir, "test")
+        dates = pd.date_range(start="2025-01-01", periods=2, freq="15min", tz="UTC")
+        df = pd.DataFrame({"value": [1, 2]}, index=dates)
+        df.index.name = "time"
+        store._update_data(df)
+        await store.serialize()
+        await store.load()
+
+        replacement = pd.DataFrame(
+            {"value": [5, 6, 7]},
+            index=pd.date_range(start="2025-01-01", periods=3, freq="15min", tz="UTC"),
+        )
+        replacement.index.name = "time"
+
+        storage_path = store.get_storage_file()
+        assert storage_path is not None
+        replacement.to_json(storage_path, compression="gzip")
+        os.utime(storage_path, None)
+
+        reloaded = await store.load_if_storage_updated()
+
+        assert reloaded is True
+        assert len(store.data) == 3
+        assert store.data["value"].tolist() == [5, 6, 7]
+
+    @pytest.mark.asyncio
+    async def test_load_preserves_partially_populated_rows(self, sample_region, temp_storage_dir):
+        """Test that persisted rows with some missing columns are kept."""
+        store1 = ConcreteDataStore(sample_region, temp_storage_dir, "test")
+        dates = pd.date_range(start="2025-01-01", periods=3, freq="15min", tz="UTC")
+        df = pd.DataFrame(
+            {
+                "value": [1.0, None, 3.0],
+                "other": [None, 2.0, None],
+            },
+            index=dates,
+        )
+        df.index.name = "time"
+        store1._update_data(df)
+        await store1.serialize()
+
+        store2 = await ConcreteDataStore(sample_region, temp_storage_dir, "test").load()
+
+        assert len(store2.data) == 3
+        assert pd.isna(store2.data.loc[dates[0], "other"])
+        assert store2.data.loc[dates[1], "other"] == pytest.approx(2.0)
+        assert pd.isna(store2.data.loc[dates[2], "other"])

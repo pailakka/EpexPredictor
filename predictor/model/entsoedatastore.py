@@ -66,30 +66,55 @@ class EntsoeDataStore(DataStore):
             qstart = rstart - timedelta(days=2)
             qend = rend + timedelta(days=2)
 
-            # A31 = daily data, week-forecast
-            # Columns "Max Forecasted Load" and "Min Forecasted Load"
-            load_forecast = await asyncio.to_thread(client.query_load_forecast, self.region.bidding_zone_entsoe, start=pd.to_datetime(qstart), end=pd.to_datetime(qend), process_type="A31")
-            load_forecast = load_forecast.resample("15min").ffill()
-            assert isinstance(load_forecast.index, pd.DatetimeIndex)
+            # A01 = Day Ahead Load Forecast (15min-60min resolution depending on region)
+            # This is much more accurate than interpolating A31 week-ahead data.
+            try:
+                load_forecast = await asyncio.to_thread(
+                    client.query_load_forecast, 
+                    self.region.bidding_zone_entsoe, 
+                    start=pd.to_datetime(qstart), 
+                    end=pd.to_datetime(qend), 
+                    process_type="A01"
+                )
+            except Exception as e:
+                # If A01 fails (e.g. forecasting too far in the future), fall back to A31 week-ahead
+                log.info(f"{self.region.bidding_zone_entsoe}: A01 load forecast not available, trying A31 fallback. ({e})")
+                load_forecast_a31 = await asyncio.to_thread(
+                    client.query_load_forecast, 
+                    self.region.bidding_zone_entsoe, 
+                    start=pd.to_datetime(qstart), 
+                    end=pd.to_datetime(qend), 
+                    process_type="A31"
+                )
+                load_forecast_a31 = load_forecast_a31.resample("15min").ffill()
+                
+                # Max load typically observed for morning/evening peaks, min at night.
+                # Adjusting to local time peaks: morning 08:00, evening 18:00
+                def resample_load_to_hourly_a31(row):
+                    maxload = row["Max Forecasted Load"]
+                    minload = row["Min Forecasted Load"]
+                    if row.name.hour == 8 and row.name.minute == 0:
+                        return maxload
+                    elif row.name.hour == 18 and row.name.minute == 0:
+                        return maxload
+                    elif row.name.hour == 13 and row.name.minute == 0:
+                        return (3 * maxload + minload) / 4.0
+                    elif row.name.hour == 3 and row.name.minute == 0:
+                        return minload
+                    return nan
+                    
+                load_forecast = load_forecast_a31.apply(resample_load_to_hourly_a31, axis=1)
 
-            # Max load is typically observed for morning/evening peaks, min load at night
-            def resample_load_to_hourly(row):
-                assert isinstance(row.name, pd.Timestamp)
-                maxload = row["Max Forecasted Load"]
-                minload = row["Min Forecasted Load"]
-                if row.name.hour == 11 and row.name.minute == 30:
-                    return maxload
-                elif row.name.hour == 19 and row.name.minute == 0:
-                    return maxload
-                elif row.name.hour == 14 and row.name.minute == 30:
-                    return (3 * maxload + minload) / 4.0
-                elif row.name.hour == 3 and row.name.minute == 0:
-                    return minload
-                return nan
-
-            load_hourly = load_forecast.apply(resample_load_to_hourly, axis=1)
-            load_hourly = load_hourly.interpolate(method='cubic').dropna()
-            load_hourly.name = "load"
+            if isinstance(load_forecast, pd.DataFrame):
+                if 'Forecasted Load' in load_forecast.columns:
+                    load_forecast = load_forecast['Forecasted Load']
+                else:
+                    load_forecast = load_forecast.iloc[:, 0]
+            
+            load_forecast.name = "load"
+            
+            # Re-sample to 15min and interpolate missing values safely
+            load_hourly = load_forecast.resample("15min").interpolate(method='cubic').dropna()
 
             assert isinstance(load_hourly.index, pd.DatetimeIndex)
             load_hourly.index = load_hourly.index.tz_convert("UTC")

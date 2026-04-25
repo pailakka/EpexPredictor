@@ -183,6 +183,7 @@ class RegionPriceManager:
     cachedeval : pd.DataFrame
     cachedquantiles: pd.DataFrame
     latest_metadata: dict[str, Any]
+    last_artifact_load: datetime
 
     update_lock: asyncio.Lock
 
@@ -197,6 +198,7 @@ class RegionPriceManager:
         self.cachedeval = pd.DataFrame()
         self.cachedquantiles = pd.DataFrame()
         self.latest_metadata = {}
+        self.last_artifact_load = datetime(1970, 1, 1, tzinfo=timezone.utc)
         self.last_known_price = datetime(1970, 1, 1, tzinfo=timezone.utc)
         self.last_generated_forecast = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
@@ -219,17 +221,19 @@ class RegionPriceManager:
 
     async def ensure_loaded(self) -> Self:
         async with self.init_lock:
-            if self.is_loaded:
-                return self
-            log.info(f"{self.predictor.region.bidding_zone_entsoe}: Loading persistent data")
-            await self.predictor.load_from_persistence()
-            self.load_cached_artifacts()
-            self.is_loaded = True
+            if not self.is_loaded:
+                log.info(f"{self.predictor.region.bidding_zone_entsoe}: Loading persistent data")
+                await self.predictor.load_from_persistence()
+                self.load_cached_artifacts()
+                self.is_loaded = True
+            else:
+                await self.refresh_from_persistence_if_updated()
         return self
 
     def load_cached_artifacts(self):
         cachedprices, cachedeval, cachedquantiles, metadata = self.forecast_artifacts.load_latest()
         self.latest_metadata = metadata
+        self.last_artifact_load = self.forecast_artifacts.get_latest_update_time() or datetime.now(timezone.utc)
         if not cachedprices.empty:
             self.cachedprices = cachedprices
         if not cachedeval.empty:
@@ -245,6 +249,24 @@ class RegionPriceManager:
         known_until = metadata.get("known_until_utc")
         if known_until:
             self.last_known_price = pd.Timestamp(known_until).to_pydatetime()
+
+    async def refresh_from_persistence_if_updated(self) -> None:
+        stores = [
+            self.predictor.weatherstore,
+            self.predictor.pricestore,
+            self.predictor.entsoestore,
+            self.predictor.marketstore,
+            self.predictor.gasstore,
+        ]
+        reloads = await asyncio.gather(*(store.load_if_storage_updated() for store in stores))
+        if any(reloads):
+            last_known = self.predictor.pricestore.get_last_known()
+            if last_known is not None:
+                self.last_known_price = last_known
+
+        artifacts_updated_at = self.forecast_artifacts.get_latest_update_time()
+        if artifacts_updated_at is not None and artifacts_updated_at > self.last_artifact_load:
+            self.load_cached_artifacts()
 
     def _ensure_fi_explainability(self):
         if self.predictor.region.bidding_zone_entsoe != "FI":
