@@ -174,7 +174,7 @@ class PricePredictor:
             except Exception as e:
                 log.warning("%s: Optuna optimization failed, using defaults: %s", self.region.bidding_zone_entsoe, e)
 
-        self.predictor = await asyncio.to_thread(
+        residual_model = await asyncio.to_thread(
             lgb.train,
             params=best_params,
             train_set=train_set,
@@ -187,11 +187,27 @@ class PricePredictor:
         if split_idx > 0 and split_idx < len(params):
             val_structural = val_x[structural_cols].fillna(0)
             val_base = self.lear_model.predict(val_structural)
-            val_res = self.predictor.predict(val_x)
+            val_res = residual_model.predict(val_x)
             val_preds = val_base + val_res
             self.calibration_residuals = pd.Series(np.abs(output_transformed.iloc[split_idx:] - val_preds))
+
+            best_iteration = residual_model.best_iteration or residual_model.current_iteration()
+            best_iteration = max(1, int(best_iteration))
+            full_train_set = lgb.Dataset(
+                params,
+                label=residual_target,
+                weight=weights,
+                categorical_feature=cat_features,
+            )
+            self.predictor = await asyncio.to_thread(
+                lgb.train,
+                params=best_params,
+                train_set=full_train_set,
+                num_boost_round=best_iteration,
+            )
         else:
             self.calibration_residuals = pd.Series([1.0])
+            self.predictor = residual_model
 
         # Keep legacy spike_classifier/quantile_models stubs so artifact store stays happy
         self.quantile_models = {}

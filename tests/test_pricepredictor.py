@@ -120,6 +120,47 @@ class TestPricePredictorTrain:
 
         assert mocked_predictor.predictor is not None
 
+    @pytest.mark.asyncio
+    async def test_train_refits_residual_model_on_full_training_frame(self, mocked_predictor, monkeypatch):
+        """Validation chooses the residual tree count, but the final model should include recent rows."""
+        train_calls = []
+
+        class FakeBooster:
+            best_iteration = 7
+
+            def current_iteration(self):
+                return self.best_iteration
+
+            def predict(self, frame):
+                return np.zeros(len(frame))
+
+        def fake_train(params, train_set, num_boost_round, **kwargs):
+            train_calls.append(
+                {
+                    "rows": len(train_set.data),
+                    "num_boost_round": num_boost_round,
+                }
+            )
+            return FakeBooster()
+
+        monkeypatch.setattr("predictor.model.pricepredictor.lgb.train", fake_train)
+        monkeypatch.setattr(
+            mocked_predictor,
+            "_optimize_hyperparameters",
+            lambda *args: mocked_predictor._lgb_params(),
+        )
+
+        start = datetime(2025, 11, 1, tzinfo=timezone.utc)
+        end = datetime(2025, 11, 2, tzinfo=timezone.utc)
+
+        await mocked_predictor.train(start, end)
+
+        trained_rows = len(mocked_predictor.traindata.dropna(subset=["price"]))
+        assert len(train_calls) == 2
+        assert train_calls[0]["rows"] < trained_rows
+        assert train_calls[1]["rows"] == trained_rows
+        assert train_calls[1]["num_boost_round"] == 7
+
 
 class TestPricePredictorPredict:
     """Tests for predict method."""
