@@ -57,11 +57,13 @@ class WeatherStore(DataStore):
                             df = pd.DataFrame()
 
                             df["time"] = fc["minutely_15"]["time"]
-                            df[f"wind_{i}"] = fc["minutely_15"]["wind_speed_80m"]
-                            df[f"temp_{i}"] = fc["minutely_15"]["temperature_2m"]
-                            df[f"irradiance_{i}"] = fc["minutely_15"]["global_tilted_irradiance"]
-                            df[f"pressure_{i}"] = fc["minutely_15"]["pressure_msl"]        
-                            df[f"humidity_{i}"] = fc["minutely_15"]["relative_humidity_2m"]
+                            df[f"wind_{i}"] = pd.to_numeric(pd.Series(fc["minutely_15"]["wind_speed_80m"]), errors="coerce")
+                            df[f"temp_{i}"] = pd.to_numeric(pd.Series(fc["minutely_15"]["temperature_2m"]), errors="coerce")
+                            # Open-Meteo's historical API can return all-null irradiance during polar night.
+                            # Treat that as zero instead of widening the column to object and dropping the whole range.
+                            df[f"irradiance_{i}"] = pd.to_numeric(pd.Series(fc["minutely_15"]["global_tilted_irradiance"]), errors="coerce").fillna(0.0)
+                            df[f"pressure_{i}"] = pd.to_numeric(pd.Series(fc["minutely_15"]["pressure_msl"]), errors="coerce")
+                            df[f"humidity_{i}"] = pd.to_numeric(pd.Series(fc["minutely_15"]["relative_humidity_2m"]), errors="coerce")
                             
                             df.set_index("time", inplace=True)
                             df = df.dropna()

@@ -24,6 +24,7 @@ REGIONS = [
     PriceRegionName.SE4.to_region(),
     PriceRegionName.DK1.to_region(),
     PriceRegionName.DK2.to_region(),
+    PriceRegionName.FI.to_region(),
 ]
 
 LEARN_DAYS : int = 120

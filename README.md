@@ -4,7 +4,8 @@ This is a simple statistical model to predict EPEX day-ahead prices based on var
 It works to a reasonably good degree. Better than many of the commercial solutions.
 This repository includes
 - The self-training prediction model itself
-- A simple FastAPI app to get a REST API up
+- A FastAPI app that serves the latest cached forecasts
+- A background worker that refreshes forecasts and stores issue-time snapshots
 - A Docker compose file to have it running wherever
 
 Supported Countries:
@@ -14,6 +15,7 @@ Supported Countries:
 - Netherlands
 - Sweden (SE1-SE4)
 - Denmark (DK1-DK2)
+- Finland (FI)
 - Others can be added relatively easily, if there is interest
 
 
@@ -48,20 +50,43 @@ Time features:
 Other:
 - Entso-E load forecast (optional, but highly recommended, especially for DE and AT)
 - Natural gas day-ahead-price, forward filled (select regions only)
+- Conservative FI-only post-model blend against yesterday's same-slot price
+- FI market-state features from ENTSO-E and optional Fingrid open data
+  - load, generation, wind and solar forecasts
+  - imbalance and cross-border flow state summaries
+  - coupled-market shadow price state for SE1, SE3, EE and NO4
+  - derived residual-load and import-headroom features
 
 Output:
 - Electricity price
+- Internal quantile forecasts and issue-time feature snapshots for evaluation
 
 ## How it works
-The model uses **LightGBM gradient boosting** to predict electricity prices. LightGBM automatically learns non-linear relationships and feature interactions, making it well-suited for electricity price prediction where factors like low wind+solar can cause price spikes due to merit order pricing.
+The runtime now has two parts:
+- `epexpredictor` serves the last good cached forecast and only falls back to request-time retraining if needed
+- `forecast-worker` refreshes data every few hours, retrains models, writes forecast artifacts and stores issue-time snapshots
+
+The core predictor stays conservative and tree-based:
+- a main LightGBM point model
+- FI quantile models (`q10`, `q50`, `q90`) for forecast distribution tracking
+- a spike classifier and spike-uplift regressor for volatile regimes
+- a small dynamic FI-only blend against yesterday's same-slot price
 
 ## Model performance
 For performance testing, see `predictor/performance_testing.py`.
+For detailed offline evaluation against actual prices, use `python -m predictor.evaluate_predictions --region FI --eval-start 2026-02-01T00:00:00Z --eval-end 2026-04-07T23:45:00Z --source backtest`.
+The evaluator reports overall metrics, lead buckets, volatility buckets and generated-at window slices. Use `--primary-window-only` to focus on the configured morning issue window for a region.
+For a visual comparison against actual prices, use `python -m predictor.plot_snapshot_evaluation`.
+- For production-faithful live evaluation, use `--source snapshots`.
+- For immediate retrospective visuals, use `--source backtest`.
+- Example: `python -m predictor.plot_snapshot_evaluation --region FI --eval-start 2026-04-01T00:00:00Z --eval-end 2026-04-07T23:45:00Z --source backtest --selection latest --output-file ./data/fi_backtest_eval.png`.
+The plot command selects one forecast per target timestamp, plots it against actual prices and baseline series, and is a better decision tool than `/eval_plot`.
 
 Remarks:
 - Tests were run in early 2026, with data from 2025-01-24 to 2026-01-24. The model is tuned for 15 minute pricing. Since data before 2025-10-01 were using hourly pricing, actual performance might be slightly better
 - The model uses a 120-day rolling training window
 - Tests were done with historical weather data. If the weather forecast is wrong, performance might be slightly worse in practice
+- Offline weather evaluation currently uses Open-Meteo historical forecast data, which is useful for backtests but not a perfect proxy for live forecast quality. Production-faithful analysis should prefer snapshot history first, and later move to Open-Meteo Previous Runs for day-ahead realism.
 
 Results (1-day ahead prediction):
 | Region | MAE (ct/kWh) | RMSE (ct/kWh) |
@@ -94,6 +119,8 @@ Feel free to generate your own plot for other time ranges or regions [here](http
 # Public API
 You can find a freely accessible installment of this software [here](https://epexpredictor.batzill.com/).
 Get a glimpse of the current prediction [here](https://epexpredictor.batzill.com/prices).
+There is also a lightweight inspector UI at `/ui` to compare cached prediction data, actual prices and selected source series.
+For FI, `/ui` also exposes a snapshot explainability workspace that loads issue-time forecast runs, grouped driver contributions, and a limited what-if sensitivity view from saved model bundles.
 
 There are no guarantees given whatsoever - it might work for you or not.
 I might stop or block this service at any time. Fair use is expected!
@@ -101,6 +128,7 @@ I might stop or block this service at any time. Fair use is expected!
 # Self Hosting
 You can easily self-host this software. For easy deployment, check out the docker compose file.
 You will probably want to register with Entso-E and request an API key.
+For FI market-feature enrichment, you can optionally add `EPEXPREDICTOR_FINGRID_API_KEY`.
 Without Entso-E API access
 - some parameters are missing and the model will perform significantly worse, especially for DE and AT
 - Some regions will not be available (e.g. SE1-4)

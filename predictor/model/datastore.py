@@ -143,7 +143,7 @@ class DataStore:
 
     def _update_data(self, df: pd.DataFrame) -> bool:
         olddata = self.data
-        self.data = df.combine_first(self.data).dropna() # keeps new data from df, fills it with existing data from self
+        self.data = df.combine_first(self.data).dropna(how="all") # keeps new data from df, fills it with existing data from self
 
         changed = not olddata.round(decimals=10).equals(self.data.round(decimals=10))
         if changed:
@@ -158,17 +158,38 @@ class DataStore:
             os.makedirs(self.storage_dir)
         return f"{self.storage_dir}/{self.storage_fn_prefix}_{self.region.bidding_zone_entsoe}.json.gz"
 
+    def get_storage_mtime(self) -> datetime | None:
+        fn = self.get_storage_file()
+        if fn is None or not os.path.exists(fn):
+            return None
+        return datetime.fromtimestamp(os.path.getmtime(fn), tz=timezone.utc)
+
     async def serialize(self):
         fn = self.get_storage_file()
         if fn is not None:
             log.info(f"{self.region.bidding_zone_entsoe}: storing new {self.storage_fn_prefix} data")
-            await asyncio.to_thread(self.data.to_json, fn, compression='gzip')
-    
+            await asyncio.to_thread(self._write_json_atomic, fn)
+
+    async def load_if_storage_updated(self) -> bool:
+        storage_mtime = self.get_storage_mtime()
+        if storage_mtime is None or storage_mtime <= self.last_updated:
+            return False
+        await self.load()
+        return True
+
     async def load(self) -> Self:
         fn = self.get_storage_file()
         if fn is not None and os.path.exists(fn):
             log.info(f"{self.region.bidding_zone_entsoe}: loading persisted {self.storage_fn_prefix} data")
-            self.data = await asyncio.to_thread(pd.read_json, fn, compression='gzip')
+            try:
+                self.data = await asyncio.to_thread(pd.read_json, fn, compression='gzip')
+            except ValueError as exc:
+                log.warning(
+                    f"{self.region.bidding_zone_entsoe}: failed to load persisted {self.storage_fn_prefix} data: {exc}. "
+                    "Ignoring the corrupted cache file."
+                )
+                self.data = pd.DataFrame()
+                return self
 
             # Handle index type: to_json saves DatetimeIndex as epoch milliseconds,
             # which read_json loads as Int64Index. Convert back to DatetimeIndex.
@@ -185,10 +206,12 @@ class DataStore:
                 self.data.index = pd.to_datetime(self.data.index, utc=True)
 
             self.data.index.set_names("time", inplace=True)
-            self.data.dropna(inplace=True)
+            self.data.dropna(how="all", inplace=True)
 
             self.last_updated = datetime.fromtimestamp(os.path.getmtime(fn), tz=timezone.utc)
         return self
 
-
-
+    def _write_json_atomic(self, fn: str):
+        tmp_fn = f"{fn}.tmp"
+        self.data.to_json(tmp_fn, compression='gzip')
+        os.replace(tmp_fn, fn)

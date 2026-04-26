@@ -68,9 +68,12 @@ class AuxDataStore(DataStore):
         df.reset_index(inplace=True)
 
         df["holiday"] = df["time"].apply(lambda t: self.is_holiday(t.astimezone(tzlocal)))
-        for i in range(6):
-            df[f"day_{i}"] = df["time"].apply(lambda t, i=i: 1 if t.astimezone(tzlocal).weekday() == i else 0)
-        
+        # Add specific integer temporal features (these will be treated as categoricals by LightGBM)
+        local_times = df["time"].dt.tz_convert(tzlocal)
+        df["weekday"] = local_times.dt.weekday
+        df["month"] = local_times.dt.month
+        df["day_of_year"] = local_times.dt.dayofyear
+        df["hour_of_day"] = local_times.dt.hour + (local_times.dt.minute / 60.0) # E.g. 14:15 becomes 14.25
         
         observer = Observer(latitude=statistics.mean(self.region.latitudes), longitude=statistics.mean(self.region.longitudes))
 
@@ -79,14 +82,22 @@ class AuxDataStore(DataStore):
         df["sr_influence"] = df["time"].apply(lambda t: (t - sun.sunrise(observer, date=t)).total_seconds())
         df["ss_influence"] = df["time"].apply(lambda t: (t - sun.sunset(observer, date=t)).total_seconds())
 
-        df["morningpeak"] = df["time"].apply(lambda t: (t - t.replace(hour=8, minute=0)).total_seconds())
-        df["eveningpeak"]  = df["time"].apply(lambda t: (t - t.replace(hour=19, minute=0)).total_seconds())
+        def _dist_to_local_hour_sec(t: pd.Timestamp, hour: int) -> float:
+            local_t = t.astimezone(tzlocal)
+            local_peak = local_t.replace(hour=hour, minute=0, second=0, microsecond=0)
+            return (local_t - local_peak).total_seconds()
+
+        df["morningpeak"] = df["time"].apply(lambda t: _dist_to_local_hour_sec(t, 8))
+        df["eveningpeak"]  = df["time"].apply(lambda t: _dist_to_local_hour_sec(t, 19))
+
+        # hour_of_week: a continuous within-week demand cycle feature for LEAR.
+        # Mon 00:00=0 ... Sun 23:45=167.75. Lets LEAR learn that Mon morning is
+        # structurally different from Sat night without needing separate dummies.
+        df["hour_of_week"] = df["weekday"] * 24.0 + local_times.dt.hour + local_times.dt.minute / 60.0
 
         df.set_index("time", inplace=True)
         return df
 
-
-    
     def is_holiday(self, t : pd.Timestamp) -> float:
         if t.weekday() == 6:
             return 1

@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from zoneinfo import ZoneInfo
 
@@ -21,7 +21,13 @@ class PriceRegion:
     longitudes: list[float]
 
     use_entsoe_load_forecast: bool = True
+    use_market_features: bool = False
     use_de_nat_gas_price: bool = True
+    yesterday_blend_weight: float = 0.0
+    retention_days: int = 365
+    worker_interval_hours: int = 3
+    primary_generated_at_window_local: tuple[int, int] = (6, 10)
+    shadow_regions: list[str] = field(default_factory=list)
     holidays: list[HolidayBase] = None # type:ignore # one entry for each regional holiday set, e.g. one for BW, one for BY, ...
     
 
@@ -52,6 +58,7 @@ class PriceRegionName(str, Enum):
     SE4 = "SE4"
     DK1 = "DK1"
     DK2 = "DK2"
+    FI = "FI"
 
     def to_region(self):
         return PRICE_REGIONS[self]
@@ -162,6 +169,17 @@ PRICE_REGIONS[PriceRegionName.DK2] = PriceRegion(
     use_de_nat_gas_price = False, # worse performance for DK
 )
 
-
-
+PRICE_REGIONS[PriceRegionName.FI] = PriceRegion(
+    country_code="FI",
+    timezone="Europe/Helsinki",
+    bidding_zone_energycharts=None,
+    bidding_zone_entsoe="FI",
+    latitudes=[60.17, 61.50, 65.01, 67.86],
+    longitudes=[24.94, 23.77, 25.47, 20.22],
+    use_market_features=True,
+    use_de_nat_gas_price=False, # no strong correlation seen outside central europe
+    yesterday_blend_weight=0.05,
+    retention_days=730,
+    shadow_regions=["SE_1", "SE_3", "EE", "NO_4"],
+)
 

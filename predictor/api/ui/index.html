@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EPEX Forecast Inspector</title>
+  <link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+  <main class="app-shell">
+    <header class="topbar">
+      <div class="topbar-copy">
+        <p class="eyebrow">Forecast Inspector</p>
+        <h1>Forecasts, actuals, and FI driver analysis.</h1>
+        <p class="lede">Read-only diagnostics over cached forecasts, issue-time snapshots, and selected model inputs. It does not retrain models or fetch upstream data on page load.</p>
+      </div>
+      <div class="status-strip" id="statusStrip">
+        <div>
+          <span class="status-label">Region</span>
+          <strong id="statusRegion">-</strong>
+        </div>
+        <div>
+          <span class="status-label">Generated</span>
+          <strong id="statusGenerated">-</strong>
+        </div>
+        <div>
+          <span class="status-label">Known Until</span>
+          <strong id="statusKnownUntil">-</strong>
+        </div>
+        <div>
+          <span class="status-label">Overlap</span>
+          <strong id="statusOverlap">-</strong>
+        </div>
+      </div>
+    </header>
+
+    <section class="controls">
+      <div class="control-row">
+        <label>
+          <span>Region</span>
+          <select id="regionSelect">
+            <option value="FI">FI</option>
+            <option value="DE">DE</option>
+            <option value="AT">AT</option>
+            <option value="BE">BE</option>
+            <option value="NL">NL</option>
+            <option value="SE1">SE1</option>
+            <option value="SE2">SE2</option>
+            <option value="SE3">SE3</option>
+            <option value="SE4">SE4</option>
+            <option value="DK1">DK1</option>
+            <option value="DK2">DK2</option>
+          </select>
+        </label>
+        <label>
+          <span>Start</span>
+          <input id="startInput" type="datetime-local">
+        </label>
+        <label>
+          <span>End</span>
+          <input id="endInput" type="datetime-local">
+        </label>
+        <div class="button-group">
+          <button class="ghost" id="preset48h" type="button">Last 48h</button>
+          <button class="ghost" id="preset7d" type="button">Last 7d</button>
+          <button class="primary" id="reloadButton" type="button">Load View</button>
+        </div>
+      </div>
+      <div class="control-row">
+        <div class="mode-switch" role="tablist" aria-label="Inspector mode">
+          <button class="mode-pill active" id="liveTabButton" type="button" data-mode="live">Live Inspector</button>
+          <button class="mode-pill" id="snapshotTabButton" type="button" data-mode="snapshot">FI Snapshot Explain</button>
+        </div>
+        <p class="section-meta mode-copy" id="modeCopy">Live inspector uses current cached forecast data and raw source series.</p>
+      </div>
+      <div class="control-row source-picker-row" id="sourcePickerRow">
+        <div class="picker-header">
+          <span>Source Series</span>
+          <p>Select a few raw inputs to render as small multiples below the live price chart.</p>
+        </div>
+        <div class="source-picker" id="sourcePicker"></div>
+      </div>
+    </section>
+
+    <section class="workspace active" id="liveWorkspace">
+      <section class="panel">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Price View</p>
+            <h2>Predicted vs actual</h2>
+          </div>
+          <p id="priceSummary" class="section-meta">No data loaded</p>
+        </div>
+        <div class="chart-frame">
+          <svg id="priceChart" class="chart-svg" viewBox="0 0 1100 360" preserveAspectRatio="none"></svg>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Source View</p>
+            <h2>Selected live inputs</h2>
+          </div>
+          <p class="section-meta" id="sourceSummary">Choose source series above</p>
+        </div>
+        <div class="small-multiples" id="sourceCharts"></div>
+      </section>
+
+      <section class="panel table-panel">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Data View</p>
+            <h2>Live merged rows</h2>
+          </div>
+          <p class="section-meta" id="tableSummary">Merged timestamps from price and selected source series</p>
+        </div>
+        <div class="table-wrap">
+          <table id="dataTable">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+
+    <section class="workspace" id="snapshotWorkspace">
+      <section class="panel">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Snapshot Selection</p>
+            <h2>Issue-time forecast run</h2>
+          </div>
+          <p class="section-meta" id="snapshotSelectionSummary">FI-only. Uses saved snapshot rows and saved model bundles.</p>
+        </div>
+        <div class="control-row">
+          <label>
+            <span>Generated At</span>
+            <select id="generatedAtSelect"></select>
+          </label>
+          <label>
+            <span>Target Time</span>
+            <select id="targetTimeSelect"></select>
+          </label>
+        </div>
+        <div class="selection-metadata" id="snapshotRunMeta"></div>
+      </section>
+
+      <section class="panel">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Snapshot Price View</p>
+            <h2>Selected snapshot vs actual</h2>
+          </div>
+          <p class="section-meta" id="snapshotSummary">No snapshot data loaded</p>
+        </div>
+        <div class="chart-frame">
+          <svg id="snapshotChart" class="chart-svg" viewBox="0 0 1100 360" preserveAspectRatio="none"></svg>
+        </div>
+      </section>
+
+      <div class="analysis-grid">
+        <section class="panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Local Explanation</p>
+              <h2>Drivers of this forecast</h2>
+            </div>
+            <p class="section-meta" id="localExplainSummary">Choose a snapshot row</p>
+          </div>
+          <div class="metric-strip" id="localMetrics"></div>
+          <div class="bars-section">
+            <h3>Group Contributions</h3>
+            <div class="bar-list" id="groupContributionBars"></div>
+          </div>
+          <div class="bars-section">
+            <h3>Model Adjustments</h3>
+            <div class="adjustment-list" id="localAdjustments"></div>
+          </div>
+          <div class="table-wrap compact-table">
+            <table id="featureContributionTable">
+              <thead></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Historical Summary</p>
+              <h2>What usually drives FI</h2>
+            </div>
+            <p class="section-meta" id="historicalSummary">Uses selected snapshot rows with actual prices</p>
+          </div>
+          <div class="bars-section">
+            <h3>Mean Absolute Group Impact</h3>
+            <div class="bar-list" id="summaryGroupBars"></div>
+          </div>
+          <div class="table-wrap compact-table">
+            <table id="summaryFeatureTable">
+              <thead></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div class="error-slice-grid" id="errorSliceCards"></div>
+        </section>
+      </div>
+
+      <section class="panel">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Scenario Tool</p>
+            <h2>Sensitivity, not causality</h2>
+          </div>
+          <p class="section-meta" id="scenarioSummary">Applies a small number of deterministic feature adjustments to the selected snapshot row.</p>
+        </div>
+        <form class="scenario-grid" id="scenarioForm">
+          <label>
+            <span>Load Forecast %</span>
+            <input id="scenarioLoadPct" type="number" step="0.1" value="0">
+          </label>
+          <label>
+            <span>Wind Forecast %</span>
+            <input id="scenarioWindPct" type="number" step="0.1" value="0">
+          </label>
+          <label>
+            <span>Solar Forecast %</span>
+            <input id="scenarioSolarPct" type="number" step="0.1" value="0">
+          </label>
+          <label>
+            <span>Import Headroom MW</span>
+            <input id="scenarioImportMw" type="number" step="1" value="0">
+          </label>
+          <label>
+            <span>Cross-Border Flow MW</span>
+            <input id="scenarioFlowMw" type="number" step="1" value="0">
+          </label>
+          <label>
+            <span>Coupled Spread Delta</span>
+            <input id="scenarioSpreadDelta" type="number" step="0.1" value="0">
+          </label>
+          <div class="button-group">
+            <button class="primary" id="scenarioRunButton" type="submit">Run Scenario</button>
+          </div>
+        </form>
+        <div class="metric-strip" id="scenarioMetrics"></div>
+        <div class="analysis-grid">
+          <div class="bars-section">
+            <h3>Group Delta</h3>
+            <div class="bar-list" id="scenarioGroupBars"></div>
+          </div>
+          <div class="bars-section">
+            <h3>Applied Inputs</h3>
+            <div class="adjustment-list" id="scenarioAppliedInputs"></div>
+          </div>
+        </div>
+        <div class="table-wrap compact-table">
+          <table id="scenarioChangedFeaturesTable">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <template id="sourceGroupTemplate">
+    <details class="source-group">
+      <summary></summary>
+      <div class="source-options"></div>
+    </details>
+  </template>
+
+  <script src="/ui/app.js"></script>
+</body>
+</html>
